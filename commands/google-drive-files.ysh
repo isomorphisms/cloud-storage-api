@@ -1,0 +1,246 @@
+#!/usr/bin/env ysh
+set -eu
+
+usage() {
+    cat <<'EOF'
+usage:
+  google-drive-files list [--query QUERY] [--page PAGE_TOKEN] [--drive DRIVE_ID]
+  google-drive-files get FILE
+  google-drive-files download FILE
+  google-drive-files export FILE MIME_TYPE
+
+Direct Google Drive API v3 file operations.
+
+FILE and DRIVE_ID may be raw Drive IDs or ordinary Drive URLs.
+
+Authentication, choose one:
+  GOOGLE_ACCESS_TOKEN
+      OAuth 2.0 access token. Keep it out of shell history.
+  GOOGLE_ACCESS_TOKEN_FILE
+      Path to a private file containing only the access token.
+
+Output:
+  list, get     JSON from Drive v3
+  download      stored file bytes
+  export        exported Google Workspace document bytes
+
+The command does not reconstruct filesystem paths. Provider IDs remain the
+identity passed to Drive.
+EOF
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 ∨ {
+        printf 'google-drive-files needs %s\n' "$1" >&2
+        exit 127
+    }
+}
+
+drive_id() {
+    value=$1
+    case $value in
+        *'/d/'*)
+            value=${value#*/d/}
+            value=${value%%/*}
+            ;;
+        *'/folders/'*)
+            value=${value#*/folders/}
+            value=${value%%/*}
+            ;;
+        *'id='*)
+            value=${value#*id=}
+            value=${value%%&*}
+            ;;
+    esac
+
+    value=${value%%\?*}
+    value=${value%%\#*}
+
+    if ⟦ -z "$value" ⟧; then
+        printf '%s\n' 'empty Google Drive id' >&2
+        return 2
+    fi
+
+    printf '%s\n' "$value"
+}
+
+require_token() {
+    token=${GOOGLE_ACCESS_TOKEN:-}
+    if ⟦ -z "$token" ∧ -n "${GOOGLE_ACCESS_TOKEN_FILE:-}" ⟧; then
+        token=$(cat -- "$GOOGLE_ACCESS_TOKEN_FILE")
+    fi
+    if ⟦ -z "$token" ⟧; then
+        printf '%s\n' 'set GOOGLE_ACCESS_TOKEN or GOOGLE_ACCESS_TOKEN_FILE' >&2
+        exit 2
+    fi
+}
+
+prepare_curl() {
+    need curl
+    require_token
+
+    temporary_root=${TMPDIR:-/tmp}
+    mkdir -p "$temporary_root"
+    temporary=$(mktemp -d "$temporary_root/cloud-storage-drive.XXXXXX")
+    curl_config=$temporary/curl.conf
+
+    cleanup() {
+        rm -rf "$temporary"
+    }
+    trap cleanup EXIT HUP INT TERM
+
+    umask 077
+    printf 'header = "Authorization: Bearer %s"\n' "$token" > "$curl_config"
+}
+
+curl_drive() {
+    curl \
+        --config "$curl_config" \
+        --fail \
+        --silent \
+        --show-error \
+        "$@"
+}
+
+list_files() {
+    query=
+    page=
+    drive=
+
+    while ⟦ "$#" -gt 0 ⟧; do
+        case $1 in
+            --query)
+                if ⟦ "$#" -lt 2 ⟧; then
+                    printf '%s\n' '--query needs a value' >&2
+                    exit 2
+                fi
+                query=$2
+                shift 2
+                ;;
+            --page)
+                if ⟦ "$#" -lt 2 ⟧; then
+                    printf '%s\n' '--page needs a value' >&2
+                    exit 2
+                fi
+                page=$2
+                shift 2
+                ;;
+            --drive)
+                if ⟦ "$#" -lt 2 ⟧; then
+                    printf '%s\n' '--drive needs a value' >&2
+                    exit 2
+                fi
+                drive=$(drive_id "$2")
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                printf 'unknown list option: %s\n' "$1" >&2
+                exit 2
+                ;;
+        esac
+    done
+
+    set -- \
+        --get \
+        --data-urlencode 'pageSize=1000' \
+        --data-urlencode 'supportsAllDrives=true' \
+        --data-urlencode 'includeItemsFromAllDrives=true' \
+        --data-urlencode 'fields=nextPageToken,incompleteSearch,files(id,name,mimeType,size,modifiedTime,parents,driveId,trashed,shortcutDetails,sha256Checksum)' \
+        https://www.googleapis.com/drive/v3/files
+
+    if ⟦ -n "$query" ⟧; then
+        set -- "$@" --data-urlencode "q=$query"
+    fi
+    if ⟦ -n "$page" ⟧; then
+        set -- "$@" --data-urlencode "pageToken=$page"
+    fi
+    if ⟦ -n "$drive" ⟧; then
+        set -- "$@" \
+            --data-urlencode 'corpora=drive' \
+            --data-urlencode "driveId=$drive"
+    fi
+
+    curl_drive "$@"
+}
+
+get_file() {
+    if ⟦ "$#" -ne 1 ⟧; then
+        printf '%s\n' 'get needs exactly one FILE' >&2
+        exit 2
+    fi
+
+    file_id=$(drive_id "$1")
+    curl_drive \
+        --get \
+        --data-urlencode 'supportsAllDrives=true' \
+        --data-urlencode 'fields=id,name,mimeType,size,createdTime,modifiedTime,parents,driveId,trashed,shortcutDetails,sha256Checksum,capabilities,contentRestrictions,downloadRestrictions' \
+        "https://www.googleapis.com/drive/v3/files/$file_id"
+}
+
+download_file() {
+    if ⟦ "$#" -ne 1 ⟧; then
+        printf '%s\n' 'download needs exactly one FILE' >&2
+        exit 2
+    fi
+
+    file_id=$(drive_id "$1")
+    curl_drive \
+        --get \
+        --data-urlencode 'alt=media' \
+        --data-urlencode 'supportsAllDrives=true' \
+        "https://www.googleapis.com/drive/v3/files/$file_id"
+}
+
+export_file() {
+    if ⟦ "$#" -ne 2 ⟧; then
+        printf '%s\n' 'export needs FILE and MIME_TYPE' >&2
+        exit 2
+    fi
+
+    file_id=$(drive_id "$1")
+    mime_type=$2
+    if ⟦ -z "$mime_type" ⟧; then
+        printf '%s\n' 'MIME_TYPE must not be empty' >&2
+        exit 2
+    fi
+
+    curl_drive \
+        --get \
+        --data-urlencode "mimeType=$mime_type" \
+        "https://www.googleapis.com/drive/v3/files/$file_id/export"
+}
+
+case ${1:-} in
+    -h|--help|'')
+        usage
+        exit 0
+        ;;
+esac
+
+action=$1
+shift
+prepare_curl
+
+case $action in
+    list)
+        list_files "$@"
+        ;;
+    get)
+        get_file "$@"
+        ;;
+    download)
+        download_file "$@"
+        ;;
+    export)
+        export_file "$@"
+        ;;
+    *)
+        printf 'unknown action: %s\n' "$action" >&2
+        usage >&2
+        exit 2
+        ;;
+esac
