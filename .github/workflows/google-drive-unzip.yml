@@ -3,6 +3,7 @@ name: Google Drive Grease contract
 on:
   pull_request:
     paths:
+      - README.md
       - commands/google-drive-files.ysh
       - commands/google-drive-unzip.ysh
       - google-apps-script/**
@@ -10,6 +11,7 @@ on:
       - .github/workflows/google-drive-unzip.yml
   push:
     paths:
+      - README.md
       - commands/google-drive-files.ysh
       - commands/google-drive-unzip.ysh
       - google-apps-script/**
