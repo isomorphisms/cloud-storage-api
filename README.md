@@ -13,6 +13,7 @@ The first documented backend is Google Drive API v3. Keep the upstream API contr
 
 ## Commands
 
+- `commands/google-drive-files.ysh` — direct Grease/YSH Google Drive v3 file operations: list/search metadata, get metadata, download stored bytes, and export Workspace-native content. Provider IDs remain first-class identity.
 - `commands/google-drive-unzip.ysh` — Grease/YSH client for Google-side ZIP extraction through a deployed Apps Script API executable. The ZIP stays in Drive; see `docs/google-drive-unzip.md`.
 
 The Drive API itself has no server-side unzip primitive; the archive command intentionally crosses into the documented Apps Script API for that higher-level operation.
