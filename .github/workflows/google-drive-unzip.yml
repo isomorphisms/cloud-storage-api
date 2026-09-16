@@ -61,13 +61,13 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GREASE_SOURCE_REVISION"
           build/py.sh minimal
-          bin/ysh -c 'x=hello; ⟦ -n "$x" ∧ ¬ "$x" = no ⟧ ∧ echo grease-runtime-ready'
+          bin/osh -c 'x=hello; ⟦ -n "$x" ∧ ¬ "$x" = no ⟧ ∧ echo grease-runtime-ready'
 
       - name: Exercise Drive clients through Grease
         shell: bash
         run: |
           set -euo pipefail
-          export GREASE="$PWD/grease-source/bin/ysh"
+          export GREASE="$PWD/grease-source/bin/osh"
           sh tests/google-drive-files.sh
           sh tests/google-drive-unzip.sh
 
