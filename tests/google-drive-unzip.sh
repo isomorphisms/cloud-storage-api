@@ -124,6 +124,7 @@ client=$root/commands/google-drive-unzip.ysh
 common_path=$fake_bin:$PATH
 
 run_client() {
+    export PATH GOOGLE_APPS_SCRIPT_DEPLOYMENT_ID GOOGLE_ACCESS_TOKEN FAKE_APPS_SCRIPT_RESULT
     "$GREASE" "$client" "$@"
 }
 
