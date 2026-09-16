@@ -40,8 +40,9 @@ The pinned v3 discovery surface contains these resource families:
 - `permissions`
 - `replies`
 - `revisions`
+- `teamdrives` — deprecated compatibility surface; use `drives` for new work
 
-The specification, not this list, is exhaustive for method parameters and schemas.
+The generated discovery document is the exhaustive source for methods, parameters, and schemas. Human-facing reference navigation can omit deprecated compatibility resources that remain present in discovery.
 
 ## The central object is a file ID, not a path
 
@@ -60,12 +61,13 @@ A shell frontend may offer path-like convenience, but internal state should reta
 
 Do not collapse all content retrieval into one operation.
 
-- Ordinary stored binary content can be retrieved as media through the file-content download surface described by the specification.
-- Google Docs, Sheets, Slides, and other Workspace-native documents generally require export to a chosen MIME type rather than byte-for-byte download of a stored local file.
+- `files.get` with `alt=media` retrieves stored blob content directly.
+- `files.export` exports a Google Workspace-native document to an explicitly requested MIME type; the pinned discovery document states a 10 MB export-content limit for this method.
+- The pinned discovery surface also contains `files.download`, a `POST` that returns a long-running `Operation`; it can accept a target MIME type for Workspace documents and a revision ID where supported. The discovery text says these operations are valid for 24 hours from creation.
 - Export formats and available MIME types are provider behavior and should remain visible at the provider boundary.
 - Metadata retrieval should remain separate from content retrieval so a listing operation does not accidentally download bodies.
 
-A generic cloud-storage layer therefore needs at least a distinction between `download stored bytes` and `export provider-native document`.
+A generic cloud-storage layer therefore needs to preserve the distinction among metadata retrieval, direct stored-byte download, provider-native export, and long-running download operations rather than hiding them behind one underspecified verb.
 
 ## ZIP and archive extraction
 
@@ -91,6 +93,7 @@ Drive supports content upload in addition to metadata-only file creation/update.
 - Small content can use the simpler upload forms.
 - Multipart requests can combine metadata and content.
 - Resumable upload is the important path for large files or unreliable connections.
+- The pinned discovery document advertises a maximum file size of 5,120 GB for `files.create` and `files.update`; treat this as a pinned API fact, not a permanent generic-provider constant.
 - Upload state should be restartable where practical rather than forcing a complete restart after interruption.
 - Do not hide provider upload-session identifiers if they are needed to resume work safely.
 
@@ -114,6 +117,7 @@ The `changes` resource is the natural incremental synchronization boundary.
 
 - Obtain a starting page token.
 - Replay change pages from a saved token.
+- The pinned discovery document says change page tokens do not expire.
 - Persist the next/new start token only after the corresponding local state transition is durable.
 - Shared-drive change logs and user change logs are distinct scopes that must not be conflated.
 - A change entry represents current state for a changed item, not necessarily a field-level diff.
@@ -126,6 +130,7 @@ For a local mirror, treat the page token as protocol state. It is not a substitu
 - `revisions` addresses historical content versions for a file.
 - Metadata changes and content revisions do not have identical semantics.
 - Retention behavior differs by content type and provider policy.
+- The pinned discovery document explicitly warns that `revisions.list` can be incomplete for files with large revision histories, including frequently edited Docs, Sheets, and Slides.
 
 A generic `version` abstraction should not be invented until another provider has been compared carefully enough to show which semantics are actually common.
 
@@ -137,7 +142,7 @@ Drive permissions are object-level provider state, not ordinary Unix mode bits.
 - Roles such as owner, organizer, file organizer, writer, commenter, and reader have Drive-specific meaning.
 - Shared-drive permission inheritance and capabilities matter.
 - The API exposes capabilities on resources; checking a capability can be safer than assuming an operation is allowed solely from a nominal role.
-- Permission mutations on the same item should be serialized rather than treated as conflict-free independent writes.
+- The pinned discovery descriptions warn that concurrent permission operations on the same file are unsupported and only the last update is applied. Serialize permission mutation at that boundary.
 
 Do not flatten this to `rwx` or a single public/private boolean.
 
@@ -162,6 +167,7 @@ Shared drives are not just folders with a different root name.
 - Several methods require explicit `supportsAllDrives`/shared-drive-aware parameters or a drive/corpus selection.
 - Ownership semantics differ from My Drive.
 - Domain administrator behavior is a separate privilege path.
+- The old `teamdrives` resource and `supportsTeamDrives`/`teamDriveId` spellings remain in the pinned discovery document as deprecated compatibility surface. New code should use the shared-drive names unless maintaining compatibility deliberately.
 
 Provider code should carry shared-drive context explicitly rather than hoping an ordinary My Drive call happens to work.
 
@@ -212,6 +218,7 @@ Likely command categories, without fixing names yet:
 - get metadata;
 - download stored bytes;
 - export provider-native content;
+- poll or retrieve long-running provider operations when required;
 - upload/create/update content;
 - create folder/container;
 - move/reparent;
