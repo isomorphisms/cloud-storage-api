@@ -9,6 +9,76 @@ mkdir -p "$fake_bin"
 
 : "${GREASE:?set GREASE to the Grease/YSH executable under test}"
 
+cat > "$fake_bin/jq" <<'EOF_JQ'
+#!/usr/bin/env python2
+from __future__ import print_function
+
+import json
+import sys
+
+arguments = sys.argv[1:]
+
+if '-n' in arguments:
+    values = {}
+    i = 0
+    while i < len(arguments):
+        if arguments[i] == '--arg':
+            values[arguments[i + 1]] = arguments[i + 2]
+            i += 3
+        else:
+            i += 1
+    json.dump({
+        'function': 'unzip_drive_file',
+        'parameters': [values.get('zip_id', ''), values.get('destination_id', '')],
+        'devMode': False,
+    }, sys.stdout, separators=(',', ':'))
+    sys.stdout.write('\n')
+    sys.exit(0)
+
+filter_text = None
+for argument in arguments:
+    if not argument.startswith('-'):
+        filter_text = argument
+        break
+
+if filter_text is None or not arguments:
+    sys.exit(64)
+
+path = arguments[-1]
+with open(path) as source:
+    value = json.load(source)
+
+if 'function == "unzip_drive_file"' in filter_text:
+    passed = (
+        value.get('function') == 'unzip_drive_file' and
+        value.get('parameters') == ['ZIP123', 'DEST456'] and
+        value.get('devMode') is False
+    )
+    sys.exit(0 if passed else 1)
+
+if filter_text == '.error? != null':
+    sys.exit(0 if value.get('error') is not None else 1)
+
+if filter_text == '.response.error? != null':
+    response = value.get('response') or {}
+    sys.exit(0 if response.get('error') is not None else 1)
+
+if '.response? != null' in filter_text and '.response.result? != null' in filter_text:
+    response = value.get('response')
+    passed = response is not None and response.get('result') is not None
+    sys.exit(0 if passed else 1)
+
+if filter_text == '.response.result':
+    result = value['response']['result']
+    json.dump(result, sys.stdout, separators=(',', ':'))
+    sys.stdout.write('\n')
+    sys.exit(0)
+
+print('unsupported fake jq filter: %s' % filter_text, file=sys.stderr)
+sys.exit(64)
+EOF_JQ
+chmod +x "$fake_bin/jq"
+
 cat > "$fake_bin/curl" <<'EOF_CURL'
 #!/bin/sh
 set -eu
