@@ -1,0 +1,79 @@
+name: Mirror Google Drive discovery document
+
+on:
+  push:
+    paths:
+      - vendor/google-drive/UPSTREAM
+      - .github/workflows/mirror-google-drive-discovery.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-google-drive-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out pinned branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch and verify pinned discovery document
+        shell: sh
+        run: |
+          set -eu
+
+          source_pin="vendor/google-drive/UPSTREAM"
+          upstream="$(sed -n 's/^repository=//p' "$source_pin")"
+          commit="$(sed -n 's/^commit=//p' "$source_pin")"
+          path="$(sed -n 's/^path=//p' "$source_pin")"
+          expected_blob="$(sed -n 's/^blob=//p' "$source_pin")"
+          license_path="$(sed -n 's/^license_path=//p' "$source_pin")"
+          expected_license_blob="$(sed -n 's/^license_blob=//p' "$source_pin")"
+
+          test -n "$upstream"
+          test -n "$commit"
+          test -n "$path"
+          test -n "$expected_blob"
+          test -n "$license_path"
+          test -n "$expected_license_blob"
+
+          raw_base="https://raw.githubusercontent.com/$upstream/$commit"
+          specification_tmp="$(mktemp)"
+          license_tmp="$(mktemp)"
+          trap 'rm -f "$specification_tmp" "$license_tmp"' EXIT
+
+          curl -fL --retry 3 --retry-delay 1 "$raw_base/$path" -o "$specification_tmp"
+          curl -fL --retry 3 --retry-delay 1 "$raw_base/$license_path" -o "$license_tmp"
+
+          actual_blob="$(git hash-object "$specification_tmp")"
+          actual_license_blob="$(git hash-object "$license_tmp")"
+          test "$actual_blob" = "$expected_blob"
+          test "$actual_license_blob" = "$expected_license_blob"
+
+          mkdir -p vendor/google-drive
+          mv "$specification_tmp" vendor/google-drive/drive.v3.json
+          mv "$license_tmp" vendor/google-drive/LICENSE
+          trap - EXIT
+
+          sha256sum vendor/google-drive/drive.v3.json > vendor/google-drive/drive.v3.json.sha256
+
+      - name: Commit exact mirror when changed
+        shell: sh
+        run: |
+          set -eu
+          paths="vendor/google-drive/drive.v3.json vendor/google-drive/drive.v3.json.sha256 vendor/google-drive/LICENSE"
+          if test -z "$(git status --porcelain -- $paths)"; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add $paths
+          git commit -m "Mirror pinned Google Drive v3 discovery document"
+          git pull --rebase origin "$GITHUB_REF_NAME"
+          git push origin "HEAD:$GITHUB_REF_NAME"
