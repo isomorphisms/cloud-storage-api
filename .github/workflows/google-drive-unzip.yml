@@ -18,6 +18,10 @@ on:
       - tests/**
       - .github/workflows/google-drive-unzip.yml
 
+concurrency:
+  group: google-drive-grease-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
