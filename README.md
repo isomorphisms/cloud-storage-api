@@ -2,11 +2,19 @@
 
 Drive common cloud storage operations from the shell.
 
-The first documented backend is Google Drive API v3. Keep the upstream API contract, our notes, and later executable code separate:
+The first documented backend is Google Drive API v3. Keep the upstream API
+contract, our notes, higher-level provider workflows, and executable code
+separate.
 
-- `vendor/google-drive/drive.v3.json` — generated exact mirror of the pinned Google Drive v3 discovery document.
-- `vendor/google-drive/UPSTREAM` — provenance and exact upstream pin.
-- `docs/google-drive-api-notes.md` — project notes and implementation implications; commentary, not the contract.
-- `AGENTS.md` — repository instructions and evidence boundaries.
+## Commands
 
-The repository begins with the API boundary before choosing a larger implementation architecture.
+- `commands/google-drive-unzip.ysh` — Grease/YSH client for Google-side ZIP
+  extraction through a deployed Apps Script API executable. The ZIP stays in
+  Drive; see `docs/google-drive-unzip.md`.
+
+## Google Drive contract work
+
+The Google Drive v3 discovery mirror is maintained separately from the command
+implementation. The Drive API itself has no server-side unzip primitive; the
+archive command intentionally crosses into the documented Apps Script API for
+that higher-level operation.
