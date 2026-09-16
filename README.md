@@ -2,7 +2,7 @@
 
 Drive common cloud storage operations from the shell.
 
-The first documented backend is Google Drive API v3. Keep the upstream API contract, our notes, and later executable code separate:
+The first documented backend is Google Drive API v3. Keep the upstream API contract, our notes, higher-level provider workflows, and executable code separate:
 
 - `vendor/google-drive/drive.v3.json` — generated exact mirror of the pinned Google Drive v3 discovery document.
 - `vendor/google-drive/UPSTREAM` — provenance and exact upstream pin.
@@ -10,6 +10,12 @@ The first documented backend is Google Drive API v3. Keep the upstream API contr
 - `docs/storage-backends.md` — notes on non-corporate, self-hosted, federated, peer-to-peer, and distributed storage models and what they imply for the common API.
 - `docs/ipfs-priority.md` — records IPFS + IPFS Cluster as the first non-Google backend target and the boundary it is meant to test.
 - `AGENTS.md` — repository instructions and evidence boundaries.
+
+## Commands
+
+- `commands/google-drive-unzip.ysh` — Grease/YSH client for Google-side ZIP extraction through a deployed Apps Script API executable. The ZIP stays in Drive; see `docs/google-drive-unzip.md`.
+
+The Drive API itself has no server-side unzip primitive; the archive command intentionally crosses into the documented Apps Script API for that higher-level operation.
 
 After the Google Drive boundary, **IPFS + IPFS Cluster is the first non-Google backend target**. It should be implemented before Garage, Syncthing, Tahoe-LAFS, Nextcloud federation, or Ceph so the common API is forced early to support content-addressed identity, peer-to-peer retrieval, and explicit persistence/replication rather than quietly becoming a Drive-shaped abstraction.
 
