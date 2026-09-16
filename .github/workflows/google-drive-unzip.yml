@@ -17,27 +17,75 @@ on:
 permissions:
   contents: read
 
+env:
+  GREASE_SOURCE_REVISION: 8052868773077602266d80bf39aad6998e2da749
+
 jobs:
-  source-contract:
+  grease-client:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out cloud storage command
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Check out exact Grease source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: isomorphisms/oils
+          ref: ${{ env.GREASE_SOURCE_REVISION }}
+          path: grease-source
+          persist-credentials: false
+
+      - name: Install Python 2 for the Grease development runtime
+        uses: actions/setup-python@v5
+        with:
+          python-version: '2.7'
+
+      - name: Install Grease development build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libffi-dev \
+            libreadline-dev \
+            libssl-dev \
+            zlib1g-dev
+
+      - name: Build exact Grease development runtime
+        working-directory: grease-source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GREASE_SOURCE_REVISION"
+          build/py.sh minimal
+          bin/ysh -c 'x=hello; ⟦ -n "$x" ∧ ¬ "$x" = no ⟧ ∧ echo grease-runtime-ready'
+
+      - name: Exercise Drive client through Grease
+        shell: bash
+        run: |
+          set -euo pipefail
+          GREASE="$PWD/grease-source/bin/ysh" sh tests/google-drive-unzip.sh
+
+      - name: State Grease evidence boundary
+        shell: sh
+        run: |
+          printf '%s\n' \
+            'PASS: exact pinned Grease/YSH execution with a fake Apps Script transport; not authenticated Google Drive acceptance.'
+
+  apps-script-source:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - name: Parse shell source conservatively
-        shell: sh
-        run: |
-          dash -n commands/google-drive-unzip.ysh
-          sh -n commands/google-drive-unzip.ysh
-      - name: Exercise client response contract
-        shell: sh
-        run: sh tests/google-drive-unzip.sh
       - name: Check Apps Script syntax and archive path policy
         shell: sh
         run: |
           cp google-apps-script/unzip-drive.gs "$RUNNER_TEMP/unzip-drive.js"
           node --check "$RUNNER_TEMP/unzip-drive.js"
           node tests/apps-script-unzip.js
-      - name: State evidence boundary
+      - name: State Apps Script evidence boundary
         shell: sh
         run: |
           printf '%s\n' \
-            'PASS: source/compatibility contract only; not a Grease runtime or authenticated Google Drive receipt.'
+            'PASS: Apps Script source/path contract only; not deployment, OAuth, or real Drive extraction.'
