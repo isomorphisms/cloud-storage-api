@@ -10,6 +10,7 @@ on:
       - tests/**
       - .github/workflows/google-drive-unzip.yml
   push:
+    branches: [main]
     paths:
       - README.md
       - commands/google-drive-files.ysh
