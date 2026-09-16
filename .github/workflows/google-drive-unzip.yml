@@ -1,14 +1,16 @@
-name: Google Drive unzip contract
+name: Google Drive Grease contract
 
 on:
   pull_request:
     paths:
+      - commands/google-drive-files.ysh
       - commands/google-drive-unzip.ysh
       - google-apps-script/**
       - tests/**
       - .github/workflows/google-drive-unzip.yml
   push:
     paths:
+      - commands/google-drive-files.ysh
       - commands/google-drive-unzip.ysh
       - google-apps-script/**
       - tests/**
@@ -25,7 +27,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - name: Check out cloud storage command
+      - name: Check out cloud storage commands
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Check out exact Grease source
@@ -62,17 +64,19 @@ jobs:
           build/py.sh minimal
           bin/ysh -c 'x=hello; ⟦ -n "$x" ∧ ¬ "$x" = no ⟧ ∧ echo grease-runtime-ready'
 
-      - name: Exercise Drive client through Grease
+      - name: Exercise Drive clients through Grease
         shell: bash
         run: |
           set -euo pipefail
-          GREASE="$PWD/grease-source/bin/ysh" sh tests/google-drive-unzip.sh
+          export GREASE="$PWD/grease-source/bin/ysh"
+          sh tests/google-drive-files.sh
+          sh tests/google-drive-unzip.sh
 
       - name: State Grease evidence boundary
         shell: sh
         run: |
           printf '%s\n' \
-            'PASS: exact pinned Grease/YSH execution with a fake Apps Script transport; not authenticated Google Drive acceptance.'
+            'PASS: exact pinned Grease/YSH execution with fake Drive v3 and Apps Script transports; not authenticated Google Drive acceptance.'
 
   apps-script-source:
     runs-on: ubuntu-latest
