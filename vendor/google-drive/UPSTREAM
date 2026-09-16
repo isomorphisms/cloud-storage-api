@@ -1,0 +1,8 @@
+repository=googleapis/google-api-python-client
+commit=8e4ffe5ed7a0520fc67374d8c4a0d93571a27fc4
+path=googleapiclient/discovery_cache/documents/drive.v3.json
+blob=0434def28714b85a44c15938f744915e3088faed
+license_path=LICENSE
+license_blob=261eeb9e9f8b2b4b0d119366dda99c6fd7d35c64
+live_discovery=https://www.googleapis.com/discovery/v1/apis/drive/v3/rest
+reference=https://developers.google.com/workspace/drive/api/reference/rest/v3
