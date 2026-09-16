@@ -7,6 +7,8 @@ trap 'rm -rf "$temporary"' EXIT HUP INT TERM
 fake_bin=$temporary/bin
 mkdir -p "$fake_bin"
 
+: "${GREASE:?set GREASE to the Grease/YSH executable under test}"
+
 cat > "$fake_bin/curl" <<'EOF_CURL'
 #!/bin/sh
 set -eu
@@ -51,12 +53,16 @@ chmod +x "$fake_bin/curl"
 client=$root/commands/google-drive-unzip.ysh
 common_path=$fake_bin:$PATH
 
+run_client() {
+    "$GREASE" "$client" "$@"
+}
+
 output=$(
     PATH=$common_path \
     GOOGLE_APPS_SCRIPT_DEPLOYMENT_ID=DEPLOY123 \
     GOOGLE_ACCESS_TOKEN=TOKEN123 \
     FAKE_APPS_SCRIPT_RESULT=success \
-        sh "$client" \
+        run_client \
         'https://drive.google.com/file/d/ZIP123/view?usp=sharing' \
         'https://drive.google.com/drive/folders/DEST456?usp=sharing'
 )
@@ -70,14 +76,15 @@ for mode in top-error script-error missing-result; do
        GOOGLE_APPS_SCRIPT_DEPLOYMENT_ID=DEPLOY123 \
        GOOGLE_ACCESS_TOKEN=TOKEN123 \
        FAKE_APPS_SCRIPT_RESULT=$mode \
-       sh "$client" ZIP123 DEST456 >/dev/null 2>&1
+       run_client ZIP123 DEST456 >/dev/null 2>&1
     then
         printf 'error response unexpectedly succeeded: %s\n' "$mode" >&2
         exit 1
     fi
 done
 
-help=$(sh "$client" --help)
+help=$(run_client --help)
 printf '%s\n' "$help" | grep -F 'google-drive-unzip DRIVE_ZIP' >/dev/null
 
-printf '%s\n' 'google-drive-unzip compatibility contract passes'
+printf 'grease=%s\n' "$GREASE"
+printf '%s\n' 'google-drive-unzip Grease contract passes'
