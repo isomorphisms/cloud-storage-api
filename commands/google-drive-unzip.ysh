@@ -144,12 +144,21 @@ then
     exit 1
 fi
 
+# The Apps Script API uses a long-running Operation-shaped response. API-level
+# failures may appear at the top level, while script execution failures are also
+# documented inside the response object. Handle both without requiring a
+# serialized `done` field: Google's protocol examples key success on
+# response.result after execution completes.
 if jq -e '.error? != null' "$response" >/dev/null; then
     jq -c '.error' "$response" >&2
     exit 1
 fi
+if jq -e '.response.error? != null' "$response" >/dev/null; then
+    jq -c '.response.error' "$response" >&2
+    exit 1
+fi
 
-if ! jq -e '.done == true and .response.result != null' "$response" >/dev/null; then
+if ! jq -e '.response? != null and .response.result? != null' "$response" >/dev/null; then
     printf '%s\n' 'Apps Script returned no successful result' >&2
     jq -c '.' "$response" >&2
     exit 1
