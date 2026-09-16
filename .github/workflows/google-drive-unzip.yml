@@ -32,6 +32,8 @@ jobs:
   grease-client:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    container:
+      image: python:2.7.18-buster@sha256:c934af72b8bd03b9804d5bde2569c320926e70392d708d113a2e71bcf98c8a20
     steps:
       - name: Check out cloud storage commands
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -44,22 +46,12 @@ jobs:
           path: grease-source
           persist-credentials: false
 
-      - name: Install Python 2 for the Grease development runtime
-        uses: actions/setup-python@v5
-        with:
-          python-version: '2.7'
-
-      - name: Install Grease development build dependencies
+      - name: Verify Python 2 test container
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            libffi-dev \
-            libreadline-dev \
-            libssl-dev \
-            zlib1g-dev
+          python2 --version
+          test "$(python2 -c 'import sys; print("%d.%d" % sys.version_info[:2])')" = 2.7
 
       - name: Build exact Grease development runtime
         working-directory: grease-source
