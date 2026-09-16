@@ -10,4 +10,6 @@ The first documented backend is Google Drive API v3. Keep the upstream API contr
 - `docs/storage-backends.md` — notes on non-corporate, self-hosted, federated, peer-to-peer, and distributed storage models and what they imply for the common API.
 - `AGENTS.md` — repository instructions and evidence boundaries.
 
+After the Google Drive boundary, **IPFS + IPFS Cluster is the first non-Google backend target**. It should be implemented before Garage, Syncthing, Tahoe-LAFS, Nextcloud federation, or Ceph so the common API is forced early to support content-addressed identity, peer-to-peer retrieval, and explicit persistence/replication rather than quietly becoming a Drive-shaped abstraction.
+
 The repository begins with the API boundary before choosing a larger implementation architecture.
