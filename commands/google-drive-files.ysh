@@ -149,8 +149,7 @@ list_files() {
         --data-urlencode 'pageSize=1000' \
         --data-urlencode 'supportsAllDrives=true' \
         --data-urlencode 'includeItemsFromAllDrives=true' \
-        --data-urlencode 'fields=nextPageToken,incompleteSearch,files(id,name,mimeType,size,modifiedTime,parents,driveId,trashed,shortcutDetails,sha256Checksum)' \
-        https://www.googleapis.com/drive/v3/files
+        --data-urlencode 'fields=nextPageToken,incompleteSearch,files(id,name,mimeType,size,modifiedTime,parents,driveId,trashed,shortcutDetails,sha256Checksum)'
 
     if ⟦ -n "$query" ⟧; then
         set -- "$@" --data-urlencode "q=$query"
@@ -164,6 +163,7 @@ list_files() {
             --data-urlencode "driveId=$drive"
     fi
 
+    set -- "$@" https://www.googleapis.com/drive/v3/files
     curl_drive "$@"
 }
 
