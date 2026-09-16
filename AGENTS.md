@@ -32,7 +32,7 @@ If the notes and the discovery mirror disagree about an endpoint, parameter, sco
 - Do not flatten Drive permissions to Unix `rwx` or a public/private boolean.
 - Do not assume folders are a separate storage primitive; in Drive they are file resources with a folder MIME type.
 - Do not assume shortcuts are transparent aliases; preserve shortcut identity and target metadata.
-- Do not claim the Drive API provides server-side ZIP extraction. The pinned v3 surface has no unzip/extract primitive; archive extraction is a higher-level client workflow.
+- Do not claim the Drive API provides server-side ZIP extraction. The pinned v3 surface has no unzip/extract primitive; archive extraction is a higher-level workflow. The current Google-side ZIP implementation deliberately crosses into the documented Apps Script API and `Utilities.unzip()` rather than inventing a Drive v3 method.
 - Keep credentials, OAuth codes, refresh tokens, access tokens, and secrets out of source, fixtures, logs, transcripts, receipts, and generated artifacts.
 
 ## Generic-provider discipline
@@ -49,14 +49,15 @@ When a second provider arrives, compare semantics explicitly before promoting an
 
 ## Shell boundary
 
-The intended interface is shell-first and composable.
+The intended interface is shell-first and composable. The current executable command line is Grease/YSH.
 
+- Keep product shell commands in Grease/YSH unless a later explicit design decision changes that boundary.
 - Keep machine-readable output distinct from human terminal presentation.
 - Prefer stdin/stdout composition where it makes sense.
 - Never truncate provider IDs in machine output.
 - Do not require a generated SDK or a large framework merely because it is convenient.
-- The implementation language is not settled by this documentation bootstrap. Do not report a POSIX/Bash bootstrap script as proof that a future Grease or Idriç implementation exists.
-- Small `sh` in vendor/update automation is infrastructure, not a decision that the product interface is Bash.
+- Small POSIX `sh` in vendor/update automation and source-contract fixtures is infrastructure/compatibility scaffolding, not evidence that the product command executed under Grease.
+- A `sh` or `dash` parse/run may catch portability regressions, but a Grease receipt must execute the current Grease/YSH implementation.
 
 Whenever giving the human a script or command block, assume `$PWD` is arbitrary. Resolve repository and file paths from the script's own location, an explicit project location, or a discovered repository root, and perform any required `cd` inside the script. Never require the human to `cd` first or rely on relative paths against their current working directory.
 
@@ -88,9 +89,10 @@ Whenever giving the human a script or command block, assume `$PWD` is arbitrary.
 
 - A green mirror workflow proves that the vendored bytes match the pinned upstream Git blobs. It does not prove authenticated Google Drive runtime behavior.
 - Static inspection of the discovery document is API-shape evidence, not an end-to-end API receipt.
+- The `Google Drive unzip contract` workflow proves source/compatibility properties only. It does not prove Grease execution, Apps Script deployment, OAuth, or a real Drive extraction.
 - A successful metadata call is not evidence that upload, download, export, permissions, shared drives, changes, or archive workflows work.
 - Acceptance claims must state the exact operation, provider account context, content type, and environment actually exercised.
-- Never promote mock, local-only, or documentation evidence into live provider acceptance.
+- Never promote mock, local-only, POSIX-compatibility, or documentation evidence into live provider or Grease acceptance.
 
 ## Change discipline
 

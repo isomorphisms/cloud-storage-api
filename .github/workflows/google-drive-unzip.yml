@@ -1,0 +1,43 @@
+name: Google Drive unzip contract
+
+on:
+  pull_request:
+    paths:
+      - commands/google-drive-unzip.ysh
+      - google-apps-script/**
+      - tests/**
+      - .github/workflows/google-drive-unzip.yml
+  push:
+    paths:
+      - commands/google-drive-unzip.ysh
+      - google-apps-script/**
+      - tests/**
+      - .github/workflows/google-drive-unzip.yml
+
+permissions:
+  contents: read
+
+jobs:
+  source-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Parse shell source conservatively
+        shell: sh
+        run: |
+          dash -n commands/google-drive-unzip.ysh
+          sh -n commands/google-drive-unzip.ysh
+      - name: Exercise client response contract
+        shell: sh
+        run: sh tests/google-drive-unzip.sh
+      - name: Check Apps Script syntax and archive path policy
+        shell: sh
+        run: |
+          cp google-apps-script/unzip-drive.gs "$RUNNER_TEMP/unzip-drive.js"
+          node --check "$RUNNER_TEMP/unzip-drive.js"
+          node tests/apps-script-unzip.js
+      - name: State evidence boundary
+        shell: sh
+        run: |
+          printf '%s\n' \
+            'PASS: source/compatibility contract only; not a Grease runtime or authenticated Google Drive receipt.'
