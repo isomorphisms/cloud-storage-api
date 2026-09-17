@@ -4,8 +4,11 @@ on:
   pull_request:
     paths:
       - README.md
-      - commands/google-drive-files.ysh
+      - commands/google-drive-api.grease
+      - commands/google-drive-files.grease
+      - commands/google-drive-v3-methods.tsv
       - commands/google-drive-unzip.ysh
+      - vendor/google-drive/**
       - google-apps-script/**
       - tests/**
       - .github/workflows/google-drive-unzip.yml
@@ -13,8 +16,11 @@ on:
     branches: [main]
     paths:
       - README.md
-      - commands/google-drive-files.ysh
+      - commands/google-drive-api.grease
+      - commands/google-drive-files.grease
+      - commands/google-drive-v3-methods.tsv
       - commands/google-drive-unzip.ysh
+      - vendor/google-drive/**
       - google-apps-script/**
       - tests/**
       - .github/workflows/google-drive-unzip.yml
@@ -30,6 +36,24 @@ env:
   GREASE_SOURCE_REVISION: 8052868773077602266d80bf39aad6998e2da749
 
 jobs:
+  drive-surface:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out cloud storage commands
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Match every Grease method row to the pinned discovery mirror
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tests/google-drive-surface.js
+
+      - name: State API-shape evidence boundary
+        shell: sh
+        run: |
+          printf '%s\n' \
+            'PASS: Grease command method table exactly matches the pinned Drive v3 discovery document; not authenticated Google Drive acceptance.'
+
   grease-client:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -68,6 +92,7 @@ jobs:
         run: |
           set -euo pipefail
           export GREASE="$PWD/grease-source/bin/osh"
+          sh tests/google-drive-api.sh
           sh tests/google-drive-files.sh
           sh tests/google-drive-unzip.sh
 
@@ -75,7 +100,7 @@ jobs:
         shell: sh
         run: |
           printf '%s\n' \
-            'PASS: exact pinned Grease/YSH execution with fake Drive v3 and Apps Script transports; not authenticated Google Drive acceptance.'
+            'PASS: exact pinned Grease execution with fake Drive v3 and Apps Script transports; not authenticated Google Drive acceptance.'
 
   apps-script-source:
     runs-on: ubuntu-latest
