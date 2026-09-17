@@ -1,0 +1,200 @@
+#!/usr/bin/env grease
+set -eu
+
+script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+api_command=$script_directory/google-drive-api.grease
+
+usage() {
+    cat <<'EOF'
+usage:
+  google-drive-files list [--query QUERY] [--page PAGE_TOKEN] [--drive DRIVE_ID]
+  google-drive-files get FILE
+  google-drive-files download FILE
+  google-drive-files export FILE MIME_TYPE
+
+Convenience commands over the complete google-drive-api Grease surface.
+
+FILE and DRIVE_ID may be raw Drive IDs or ordinary Drive URLs. Provider IDs
+remain first-class identity; this command does not reconstruct filesystem paths.
+
+list/get include thumbnail metadata needed by local viewers:
+  hasThumbnail
+  thumbnailLink
+  thumbnailVersion
+  imageMediaMetadata
+  videoMediaMetadata
+EOF
+}
+
+drive_id() {
+    value=$1
+    case $value in
+        *'/d/'*)
+            value=${value#*/d/}
+            value=${value%%/*}
+            ;;
+        *'/folders/'*)
+            value=${value#*/folders/}
+            value=${value%%/*}
+            ;;
+        *'id='*)
+            value=${value#*id=}
+            value=${value%%&*}
+            ;;
+    esac
+
+    value=${value%%\?*}
+    value=${value%%\#*}
+
+    if [ -z "$value" ]; then
+        printf '%s\n' 'empty Google Drive id' >&2
+        return 2
+    fi
+
+    printf '%s\n' "$value"
+}
+
+run_api() {
+    if [ -n "${GREASE:-}" ]; then
+        "$GREASE" "$api_command" "$@"
+    else
+        "$api_command" "$@"
+    fi
+}
+
+list_files() {
+    provider_query=
+    page=
+    drive=
+
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --query)
+                [ "$#" -ge 2 ] || {
+                    printf '%s\n' '--query needs a value' >&2
+                    exit 2
+                }
+                provider_query=$2
+                shift 2
+                ;;
+            --page)
+                [ "$#" -ge 2 ] || {
+                    printf '%s\n' '--page needs a value' >&2
+                    exit 2
+                }
+                page=$2
+                shift 2
+                ;;
+            --drive)
+                [ "$#" -ge 2 ] || {
+                    printf '%s\n' '--drive needs a value' >&2
+                    exit 2
+                }
+                drive=$(drive_id "$2")
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                printf 'unknown list option: %s\n' "$1" >&2
+                exit 2
+                ;;
+        esac
+    done
+
+    set -- drive.files.list \
+        --query 'pageSize=1000' \
+        --query 'supportsAllDrives=true' \
+        --query 'includeItemsFromAllDrives=true' \
+        --query 'fields=nextPageToken,incompleteSearch,files(id,name,mimeType,size,modifiedTime,parents,driveId,trashed,shortcutDetails,sha256Checksum,hasThumbnail,thumbnailLink,thumbnailVersion,imageMediaMetadata,videoMediaMetadata)'
+
+    if [ -n "$provider_query" ]; then
+        set -- "$@" --query "q=$provider_query"
+    fi
+    if [ -n "$page" ]; then
+        set -- "$@" --query "pageToken=$page"
+    fi
+    if [ -n "$drive" ]; then
+        set -- "$@" \
+            --query 'corpora=drive' \
+            --query "driveId=$drive"
+    fi
+
+    run_api "$@"
+}
+
+get_file() {
+    [ "$#" -eq 1 ] || {
+        printf '%s\n' 'get needs exactly one FILE' >&2
+        exit 2
+    }
+
+    file_id=$(drive_id "$1")
+    run_api drive.files.get \
+        --path "fileId=$file_id" \
+        --query 'supportsAllDrives=true' \
+        --query 'fields=id,name,mimeType,size,createdTime,modifiedTime,parents,driveId,trashed,shortcutDetails,sha256Checksum,capabilities,contentRestrictions,downloadRestrictions,hasThumbnail,thumbnailLink,thumbnailVersion,imageMediaMetadata,videoMediaMetadata'
+}
+
+download_file() {
+    [ "$#" -eq 1 ] || {
+        printf '%s\n' 'download needs exactly one FILE' >&2
+        exit 2
+    }
+
+    file_id=$(drive_id "$1")
+    run_api drive.files.get \
+        --path "fileId=$file_id" \
+        --query 'alt=media' \
+        --query 'supportsAllDrives=true'
+}
+
+export_file() {
+    [ "$#" -eq 2 ] || {
+        printf '%s\n' 'export needs FILE and MIME_TYPE' >&2
+        exit 2
+    }
+
+    file_id=$(drive_id "$1")
+    mime_type=$2
+    [ -n "$mime_type" ] || {
+        printf '%s\n' 'MIME_TYPE must not be empty' >&2
+        exit 2
+    }
+
+    run_api drive.files.export \
+        --path "fileId=$file_id" \
+        --query "mimeType=$mime_type"
+}
+
+case ${1:-} in
+    -h|--help|'')
+        usage
+        exit 0
+        ;;
+esac
+
+action=$1
+shift
+
+case $action in
+    list)
+        list_files "$@"
+        ;;
+    get)
+        get_file "$@"
+        ;;
+    download)
+        download_file "$@"
+        ;;
+    export)
+        export_file "$@"
+        ;;
+    *)
+        printf 'unknown action: %s\n' "$action" >&2
+        usage >&2
+        exit 2
+        ;;
+esac

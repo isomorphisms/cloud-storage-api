@@ -1,0 +1,437 @@
+#!/usr/bin/env grease
+set -eu
+LC_ALL=C
+export LC_ALL
+
+script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+method_table=$script_directory/google-drive-v3-methods.tsv
+base_url=https://www.googleapis.com/drive/v3/
+upload_base_url=https://www.googleapis.com/upload/drive/v3/
+
+usage() {
+    cat <<'EOF'
+usage:
+  google-drive-api methods
+  google-drive-api surface
+  google-drive-api METHOD [OPTIONS]
+
+METHOD is a pinned Google Drive v3 discovery method ID, for example:
+  drive.files.list
+  drive.files.get
+  drive.permissions.create
+  drive.approvals.start
+
+The leading "drive." may be omitted.
+
+Options:
+  --path NAME=VALUE
+      Fill one named path parameter from the discovery path.
+
+  --query NAME=VALUE
+      Append one provider-native query parameter. Repeat as needed.
+      No Drive query parameter is renamed or flattened.
+
+  --body FILE
+      Send FILE as the JSON request body. Use - to read the JSON body from stdin.
+      Only methods whose discovery entry has a request schema accept this option.
+
+  --media FILE
+      Upload FILE through the resumable upload URI. Only discovery methods that
+      advertise media upload accept this option.
+
+  --media-type MIME_TYPE
+      MIME type for --media. Default: application/octet-stream.
+
+  --session-file FILE
+      Durable resumable-upload session record. Required with --media.
+      The session URI is written before content upload and retained on failure.
+
+Environment:
+  GOOGLE_ACCESS_TOKEN
+  GOOGLE_ACCESS_TOKEN_FILE
+      Supply one OAuth 2.0 access token. The token is placed in a mode-0600 curl
+      config rather than curl argv.
+
+  GOOGLE_DRIVE_RESOURCE_KEYS
+      Optional value for X-Goog-Drive-Resource-Keys.
+
+Output:
+  API response bytes are written unchanged to stdout.
+  Diagnostics are written to stderr.
+
+The command is a thin Drive transport. Opaque IDs, shared-drive parameters,
+permissions, revisions, change cursors, approvals, and deprecated Team Drive
+methods remain provider-native.
+EOF
+}
+
+fail() {
+    printf '%s\n' "$*" >&2
+    exit 2
+}
+
+need_command() {
+    command -v "$1" >/dev/null 2>&1 || {
+        printf 'google-drive-api needs %s\n' "$1" >&2
+        exit 127
+    }
+}
+
+encode_url_component() {
+    remaining=$1
+    encoded=
+    while [ -n "$remaining" ]; do
+        first_byte=${remaining%"${remaining#?}"}
+        remaining=${remaining#?}
+        case $first_byte in
+            [A-Za-z0-9.~_-])
+                encoded=$encoded$first_byte
+                ;;
+            *)
+                hexadecimal=$(printf '%02X' "'$first_byte")
+                encoded=$encoded%$hexadecimal
+                ;;
+        esac
+    done
+    printf '%s' "$encoded"
+}
+
+append_query_pair() {
+    pair=$1
+    case $pair in
+        *=*)
+            name=${pair%%=*}
+            value=${pair#*=}
+            ;;
+        *)
+            fail "--query needs NAME=VALUE: $pair"
+            ;;
+    esac
+
+    [ -n "$name" ] || fail '--query name must not be empty'
+
+    encoded_name=$(encode_url_component "$name")
+    encoded_value=$(encode_url_component "$value")
+    if [ -z "$query_string" ]; then
+        query_string=?$encoded_name=$encoded_value
+    else
+        query_string=$query_string\&$encoded_name=$encoded_value
+    fi
+}
+
+replace_path_value() {
+    pair=$1
+    case $pair in
+        *=*)
+            name=${pair%%=*}
+            value=${pair#*=}
+            ;;
+        *)
+            fail "--path needs NAME=VALUE: $pair"
+            ;;
+    esac
+
+    [ -n "$name" ] || fail '--path name must not be empty'
+    placeholder=\{$name\}
+
+    case $api_path in
+        *"$placeholder"*)
+            prefix=${api_path%%"$placeholder"*}
+            suffix=${api_path#*"$placeholder"}
+            encoded_value=$(encode_url_component "$value")
+            api_path=$prefix$encoded_value$suffix
+            ;;
+        *)
+            fail "method $requested_method has no path parameter named $name"
+            ;;
+    esac
+}
+
+require_token() {
+    token=${GOOGLE_ACCESS_TOKEN:-}
+    if [ -z "$token" ] && [ -n "${GOOGLE_ACCESS_TOKEN_FILE:-}" ]; then
+        token=$(cat -- "$GOOGLE_ACCESS_TOKEN_FILE")
+    fi
+    [ -n "$token" ] || fail 'set GOOGLE_ACCESS_TOKEN or GOOGLE_ACCESS_TOKEN_FILE'
+}
+
+prepare_curl() {
+    need_command curl
+    require_token
+
+    temporary_root=${TMPDIR:-/tmp}
+    mkdir -p "$temporary_root"
+    temporary=$(mktemp -d "$temporary_root/cloud-storage-drive-api.XXXXXX")
+    curl_config=$temporary/curl.conf
+
+    cleanup() {
+        rm -rf "$temporary"
+    }
+    trap cleanup EXIT HUP INT TERM
+
+    umask 077
+    printf 'header = "Authorization: Bearer %s"\n' "$token" > "$curl_config"
+    if [ -n "${GOOGLE_DRIVE_RESOURCE_KEYS:-}" ]; then
+        printf 'header = "X-Goog-Drive-Resource-Keys: %s"\n' \
+            "$GOOGLE_DRIVE_RESOURCE_KEYS" >> "$curl_config"
+    fi
+}
+
+load_method() {
+    candidate_method=
+    candidate_http=
+    candidate_path=
+    candidate_request=
+    candidate_upload=
+    candidate_status=
+    found_method=
+
+    tab=$(printf '\t')
+    while IFS="$tab" read -r \
+        candidate_method candidate_http candidate_path \
+        candidate_request candidate_upload candidate_status
+    do
+        [ -n "$candidate_method" ] || continue
+        case $candidate_method in
+            \#*) continue ;;
+        esac
+
+        if [ "$candidate_method" = "$requested_method" ]; then
+            http_method=$candidate_http
+            api_path=$candidate_path
+            request_kind=$candidate_request
+            upload_kind=$candidate_upload
+            method_status=$candidate_status
+            found_method=yes
+            break
+        fi
+    done < "$method_table"
+
+    [ -n "$found_method" ] || fail "unknown pinned Drive method: $requested_method"
+}
+
+show_methods() {
+    cut -f1 "$method_table"
+}
+
+show_surface() {
+    cat "$method_table"
+}
+
+request_regular() {
+    if [ "$request_kind" = none ] && [ -n "$body_file" ]; then
+        fail "$requested_method has no request body in the pinned discovery document"
+    fi
+
+    request_url=$base_url$api_path$query_string
+    set -- \
+        --config "$curl_config" \
+        --fail \
+        --silent \
+        --show-error \
+        --request "$http_method"
+
+    if [ -n "$body_file" ]; then
+        set -- "$@" \
+            --header 'Content-Type: application/json' \
+            --data-binary "@$body_file"
+    fi
+
+    curl "$@" "$request_url"
+}
+
+write_session_record() {
+    session_uri=$1
+    session_directory=$(dirname -- "$session_file")
+    mkdir -p "$session_directory"
+    umask 077
+
+    session_temporary=$session_file.tmp.$$
+    {
+        printf 'method=%s\n' "$requested_method"
+        printf 'path=%s\n' "$api_path"
+        printf 'media=%s\n' "$media_file"
+        printf 'media_type=%s\n' "$media_type"
+        printf 'media_size=%s\n' "$media_size"
+        printf 'session_uri=%s\n' "$session_uri"
+    } > "$session_temporary"
+    mv -f -- "$session_temporary" "$session_file"
+}
+
+read_session_uri() {
+    [ -f "$session_file" ] || return 1
+    session_uri=$(sed -n 's/^session_uri=//p' "$session_file" | tail -n 1)
+    [ -n "$session_uri" ]
+}
+
+start_resumable_session() {
+    upload_query=$query_string
+    if [ -z "$upload_query" ]; then
+        upload_query='?uploadType=resumable'
+    else
+        upload_query=$upload_query'&uploadType=resumable'
+    fi
+    initiation_url=$upload_base_url$api_path$upload_query
+    response_headers=$temporary/resumable-headers.txt
+
+    set -- \
+        --config "$curl_config" \
+        --fail \
+        --silent \
+        --show-error \
+        --request "$http_method" \
+        --dump-header "$response_headers" \
+        --output /dev/null \
+        --header "X-Upload-Content-Type: $media_type" \
+        --header "X-Upload-Content-Length: $media_size"
+
+    if [ -n "$body_file" ]; then
+        set -- "$@" \
+            --header 'Content-Type: application/json; charset=UTF-8' \
+            --data-binary "@$body_file"
+    else
+        set -- "$@" \
+            --header 'Content-Type: application/json; charset=UTF-8' \
+            --data-binary '{}'
+    fi
+
+    curl "$@" "$initiation_url"
+
+    session_uri=$(
+        sed -n 's/^[Ll][Oo][Cc][Aa][Tt][Ii][Oo][Nn]:[[:space:]]*//p' \
+            "$response_headers" |
+        tr -d '\r' |
+        tail -n 1
+    )
+    [ -n "$session_uri" ] || {
+        printf '%s\n' 'resumable upload did not return a Location header' >&2
+        exit 1
+    }
+
+    write_session_record "$session_uri"
+}
+
+request_resumable_upload() {
+    [ "$upload_kind" = resumable ] ||
+        fail "$requested_method does not advertise media upload in the pinned discovery document"
+
+    [ -n "$session_file" ] ||
+        fail '--session-file is required with --media so resumable state survives failure'
+
+    [ -f "$media_file" ] || fail "media file not found: $media_file"
+    media_size=$(wc -c < "$media_file" | tr -d '[:space:]')
+    [ -n "$media_size" ] || fail "could not determine media size: $media_file"
+
+    if read_session_uri; then
+        :
+    else
+        start_resumable_session
+    fi
+
+    if curl \
+        --config "$curl_config" \
+        --fail \
+        --silent \
+        --show-error \
+        --request PUT \
+        --header "Content-Type: $media_type" \
+        --header "Content-Length: $media_size" \
+        --data-binary "@$media_file" \
+        "$session_uri"
+    then
+        rm -f -- "$session_file"
+    else
+        printf 'resumable session retained at %s\n' "$session_file" >&2
+        exit 1
+    fi
+}
+
+case ${1:-} in
+    -h|--help|'')
+        usage
+        exit 0
+        ;;
+    methods)
+        show_methods
+        exit 0
+        ;;
+    surface)
+        show_surface
+        exit 0
+        ;;
+esac
+
+requested_method=$1
+shift
+case $requested_method in
+    drive.*) ;;
+    *) requested_method=drive.$requested_method ;;
+esac
+
+load_method
+
+query_string=
+body_file=
+media_file=
+media_type=application/octet-stream
+session_file=
+
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --path)
+            [ "$#" -ge 2 ] || fail '--path needs NAME=VALUE'
+            replace_path_value "$2"
+            shift 2
+            ;;
+        --query)
+            [ "$#" -ge 2 ] || fail '--query needs NAME=VALUE'
+            append_query_pair "$2"
+            shift 2
+            ;;
+        --body)
+            [ "$#" -ge 2 ] || fail '--body needs FILE or -'
+            body_file=$2
+            shift 2
+            ;;
+        --media)
+            [ "$#" -ge 2 ] || fail '--media needs FILE'
+            media_file=$2
+            shift 2
+            ;;
+        --media-type)
+            [ "$#" -ge 2 ] || fail '--media-type needs MIME_TYPE'
+            media_type=$2
+            shift 2
+            ;;
+        --session-file)
+            [ "$#" -ge 2 ] || fail '--session-file needs FILE'
+            session_file=$2
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            fail "unknown option: $1"
+            ;;
+    esac
+done
+
+case $api_path in
+    *'{'*)
+        fail "missing --path value for $requested_method path $api_path"
+        ;;
+esac
+
+if [ -n "$body_file" ] && [ "$body_file" != - ] && [ ! -f "$body_file" ]; then
+    fail "JSON body file not found: $body_file"
+fi
+
+prepare_curl
+
+if [ -n "$media_file" ]; then
+    request_resumable_upload
+else
+    request_regular
+fi

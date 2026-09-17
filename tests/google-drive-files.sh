@@ -7,26 +7,27 @@ trap 'rm -rf "$temporary"' EXIT HUP INT TERM
 fake_bin=$temporary/bin
 log=$temporary/curl-arguments.txt
 mkdir -p "$fake_bin"
+: > "$log"
 
-: "${GREASE:?set GREASE to the Grease/YSH executable under test}"
+: "${GREASE:?set GREASE to the Grease executable under test}"
 
 cat > "$fake_bin/curl" <<'EOF_CURL'
 #!/bin/sh
 set -eu
 : "${FAKE_CURL_LOG:?}"
-: > "$FAKE_CURL_LOG"
+
 for argument in "$@"; do
     printf '%s\n' "$argument" >> "$FAKE_CURL_LOG"
 done
 
 case " $* " in
-    *'/export'*)
+    *'/export?'*)
         printf '%s' 'EXPORTED-BYTES'
         ;;
     *'alt=media'*)
         printf '%s' 'STORED-BYTES'
         ;;
-    *'/files/FILE123'*)
+    *'/files/FILE123?'*)
         printf '%s\n' '{"id":"FILE123","name":"report.txt"}'
         ;;
     *)
@@ -36,20 +37,21 @@ esac
 EOF_CURL
 chmod +x "$fake_bin/curl"
 
-client=$root/commands/google-drive-files.ysh
+client=$root/commands/google-drive-files.grease
 common_path=$fake_bin:$PATH
 
 run_client() {
     PATH=$common_path \
     GOOGLE_ACCESS_TOKEN=SECRET_TOKEN_VALUE \
     FAKE_CURL_LOG=$log \
+    GREASE="$GREASE" \
         "$GREASE" "$client" "$@"
 }
 
 assert_log() {
     pattern=$1
     grep -F -- "$pattern" "$log" >/dev/null || {
-        printf 'missing curl argument: %s\n' "$pattern" >&2
+        printf 'missing curl argument text: %s\n' "$pattern" >&2
         cat "$log" >&2
         exit 1
     }
@@ -73,13 +75,14 @@ list_output=$(
     printf 'unexpected list result: %s\n' "$list_output" >&2
     exit 1
 }
-assert_log 'https://www.googleapis.com/drive/v3/files'
-assert_log "q=name contains 'report'"
+assert_log 'https://www.googleapis.com/drive/v3/files?'
+assert_log 'q=name%20contains%20%27report%27'
 assert_log 'pageToken=PAGE123'
 assert_log 'corpora=drive'
 assert_log 'driveId=DRIVE123'
-assert_log 'includeItemsFromAllDrives=true'
-assert_log 'supportsAllDrives=true'
+assert_log 'thumbnailLink'
+assert_log 'thumbnailVersion'
+assert_log 'hasThumbnail'
 assert_token_not_in_argv
 
 get_output=$(run_client get 'https://drive.google.com/file/d/FILE123/view?usp=sharing')
@@ -87,8 +90,9 @@ get_output=$(run_client get 'https://drive.google.com/file/d/FILE123/view?usp=sh
     printf 'unexpected get result: %s\n' "$get_output" >&2
     exit 1
 }
-assert_log 'https://www.googleapis.com/drive/v3/files/FILE123'
+assert_log 'https://www.googleapis.com/drive/v3/files/FILE123?'
 assert_log 'supportsAllDrives=true'
+assert_log 'thumbnailLink'
 assert_token_not_in_argv
 
 download_output=$(run_client download BLOB123)
@@ -96,8 +100,7 @@ download_output=$(run_client download BLOB123)
     printf 'unexpected download result: %s\n' "$download_output" >&2
     exit 1
 }
-assert_log 'https://www.googleapis.com/drive/v3/files/BLOB123'
-assert_log 'alt=media'
+assert_log 'https://www.googleapis.com/drive/v3/files/BLOB123?alt=media'
 assert_token_not_in_argv
 
 export_output=$(run_client export 'https://drive.google.com/open?id=WORK123' application/pdf)
@@ -105,11 +108,11 @@ export_output=$(run_client export 'https://drive.google.com/open?id=WORK123' app
     printf 'unexpected export result: %s\n' "$export_output" >&2
     exit 1
 }
-assert_log 'https://www.googleapis.com/drive/v3/files/WORK123/export'
-assert_log 'mimeType=application/pdf'
+assert_log 'https://www.googleapis.com/drive/v3/files/WORK123/export?mimeType=application%2Fpdf'
 assert_token_not_in_argv
 
 help=$("$GREASE" "$client" --help)
 printf '%s\n' "$help" | grep -F 'google-drive-files list' >/dev/null
+printf '%s\n' "$help" | grep -F 'thumbnailVersion' >/dev/null
 
 printf '%s\n' 'google-drive-files Grease contract passes'
