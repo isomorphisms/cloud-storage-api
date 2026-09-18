@@ -20,12 +20,15 @@ FILE may be a raw Drive file ID or an ordinary Drive URL.
 
 The command performs only bounded reads:
   1. metadata through drive.files.get;
-  2. at most 65,557 bytes from the archive tail;
-  3. exactly the classic ZIP central-directory range.
+  2. at most 65,577 bytes from the archive tail;
+  3. for ZIP64, exactly 56 bytes from the ZIP64 end-of-central-directory record;
+  4. exactly the central-directory range named by the validated end record.
 
-ZIP64, multi-disk archives, encrypted members, unsupported compression methods,
-unsafe paths, and duplicate member names are rejected. The current accepted
-compression methods are stored (0) and deflate (8).
+Classic ZIP and ordinary single-disk ZIP64 are accepted. Multi-disk archives,
+encrypted members, central-directory features newer than ZIP64 version 4.5,
+unsupported compression methods, unsafe paths, and duplicate member names are
+rejected. The current accepted compression methods are stored (0) and
+deflate (8).
 
 Selection is optional and happens after validating the complete central
 directory. At most one selector may be supplied:
@@ -218,9 +221,48 @@ tail_headers=$temporary/tail.headers
 fetch_range "$tail_start" "$tail_end" "$tail_length" "$tail_file" "$tail_headers"
 
 eocd=$($zip_indexer eocd "$source_size" "$tail_start" "$tail_file")
-IFS="$tab" read -r central_start central_end central_size member_count eocd_offset <<EOF_EOCD
+IFS="$tab" read -r eocd_kind field_1 field_2 field_3 field_4 field_5 <<EOF_EOCD
 $eocd
 EOF_EOCD
+
+zip64=false
+zip64_eocd_start=
+zip64_eocd_end=
+zip64_locator_offset=
+case $eocd_kind in
+    classic)
+        central_start=$field_1
+        central_end=$field_2
+        central_size=$field_3
+        member_count=$field_4
+        eocd_offset=$field_5
+        ;;
+    zip64)
+        zip64=true
+        zip64_eocd_start=$field_1
+        zip64_eocd_end=$field_2
+        zip64_eocd_length=$field_3
+        zip64_locator_offset=$field_4
+        eocd_offset=$field_5
+
+        zip64_eocd_file=$temporary/zip64-eocd.bin
+        zip64_eocd_headers=$temporary/zip64-eocd.headers
+        fetch_range \
+            "$zip64_eocd_start" "$zip64_eocd_end" "$zip64_eocd_length" \
+            "$zip64_eocd_file" "$zip64_eocd_headers"
+
+        zip64_values=$($zip_indexer zip64-eocd \
+            "$source_size" "$zip64_eocd_start" "$zip64_locator_offset" \
+            "$zip64_eocd_file")
+        IFS="$tab" read -r \
+            central_start central_end central_size member_count unused_zip64_start <<EOF_ZIP64
+$zip64_values
+EOF_ZIP64
+        ;;
+    *)
+        fail "unknown ZIP end-record kind: $eocd_kind"
+        ;;
+esac
 
 central_file=$temporary/central-directory.bin
 if [ "$central_size" = 0 ]; then
@@ -247,8 +289,11 @@ jq -cn \
     --arg size "$source_size" \
     --arg sha256 "$source_sha256" \
     --arg mime_type "$source_mime" \
+    --arg zip64 "$zip64" \
     --arg tail_start "$tail_start" \
     --arg tail_end "$tail_end" \
+    --arg zip64_eocd_start "$zip64_eocd_start" \
+    --arg zip64_eocd_end "$zip64_eocd_end" \
     --arg central_start "$central_start" \
     --arg central_end "$central_end" \
     --arg central_size "$central_size" \
@@ -263,14 +308,20 @@ jq -cn \
         size: ($size | tonumber),
         sha256_checksum: (if $sha256 == "" then null else $sha256 end),
         mime_type: $mime_type,
-        range_reads: {
-            tail: {start: ($tail_start | tonumber), end: ($tail_end | tonumber)},
+        zip64: ($zip64 == "true"),
+        range_reads: ({
+            tail: {start: ($tail_start | tonumber), end: ($tail_end | tonumbes)},
             central_directory: {
                 start: ($central_start | tonumber),
                 end: ($central_end | tonumber),
                 size: ($central_size | tonumber)
             }
-        },
+        } + if $zip64 == "true" then {
+            zip64_end_of_central_directory: {
+                start: ($zip64_eocd_start | tonumber),
+                end: ($zip64_eocd_end | tonumber)
+            }
+        } else {} end),
         eocd_offset: ($eocd_offset | tonumber),
         member_count: ($member_count | tonumber),
         selected_member_count: ($selected_member_count | tonumber)

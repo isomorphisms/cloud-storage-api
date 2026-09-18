@@ -1,4 +1,4 @@
-name: Google Drive ZIP range inventory
+name: Google Drive ZIP / ZIP64 range inventory
 
 on:
   pull_request:
@@ -37,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
-      - name: Exercise deterministic local ZIP range fixture
+      - name: Exercise deterministic local ZIP and ZIP64 range fixtures
         shell: bash
         run: |
           set -euo pipefail
@@ -48,7 +48,7 @@ jobs:
         shell: sh
         run: |
           printf '%s\n' \
-            'PASS stage 1: deterministic local ZIP tail/central-directory parsing and rejection policy only; no Drive or Grease claim.'
+            'PASS stage 1: deterministic local classic ZIP and sparse ZIP64 bounded-range parsing and rejection policy only; no Drive or Grease claim.'
 
   stage-2-fake-drive-grease:
     runs-on: ubuntu-24.04
@@ -119,4 +119,4 @@ jobs:
         shell: sh
         run: |
           printf '%s\n' \
-            'PASS stage 2: exact pinned Grease with fake Drive metadata and bounded HTTP Range transport; not authenticated Drive acceptance.'
+            'PASS stage 2: exact pinned Grease with fake Drive bounded HTTP Range transport for classic ZIP and ZIP64; not authenticated Drive acceptance.'

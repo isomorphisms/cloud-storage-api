@@ -80,13 +80,18 @@ server-side unzip primitive.
 
 ## Large ZIP range inventory
 
-`commands/google-drive-zip-inventory.grease` inventories a classic ZIP stored in
-Drive without downloading the complete archive. It first gets Drive metadata,
-then performs at most two bounded byte-range reads for inventory:
+`commands/google-drive-zip-inventory.grease` inventories classic ZIP and
+ordinary single-disk ZIP64 archives stored in Drive without downloading the
+complete archive. It first gets Drive metadata, then performs bounded byte-range
+reads:
 
-1. at most 65,557 bytes from the archive tail, enough to locate the classic ZIP
-   end-of-central-directory record and its maximum comment;
-2. exactly the central-directory byte range named by that record.
+1. at most 65,577 bytes from the archive tail, covering the classic
+   end-of-central-directory record, maximum classic comment, and the 20-byte
+   ZIP64 locator when present;
+2. for ZIP64 only, exactly the 56-byte fixed ZIP64 end-of-central-directory
+   record identified by the locator;
+3. exactly the central-directory byte range named by the validated classic or
+   ZIP64 end record.
 
 The command requires HTTP 206 and an exact `Content-Range` matching the
 requested interval and Drive's metadata size. Each curl transfer also has a hard
@@ -98,20 +103,26 @@ running-transfer limit when the response size was not known up front.
 `commands/zip-central-directory.c` is deliberately narrower than a ZIP
 library. Grease owns Drive identity, authentication, metadata, and ranged
 transport; the C helper only parses already-bounded local binary slices and
-performs 64-bit ZIP offset arithmetic. This avoids putting NUL-containing ZIP
-records or multi-gigabyte offsets through shell variables, including on ARMv7.
+performs fixed-width ZIP/ZIP64 offset arithmetic. ZIP64 member values are read
+from extra field `0x0001` only when the corresponding classic field contains
+its ZIP64 sentinel, in the ordering defined by the ZIP format. This keeps
+NUL-containing binary records and multi-gigabyte offsets out of shell variables,
+including on ARMv7.
 
 Inventory output is NDJSON: one archive record followed by selected member
 records. `--exact`, `--prefix`, and `--glob` select members after the complete
-central directory has been validated. The current classic-ZIP boundary accepts
-stored and deflate members and rejects ZIP64, multi-disk archives, encryption,
-unsupported compression methods, unsafe member paths, and duplicate ambiguous
-member names.
+central directory has been validated. The current boundary accepts stored and
+deflate members, caps a central directory at 64 MiB and one million entries, and
+rejects multi-disk archives, encryption, malformed ZIP64 metadata, ZIP64
+features newer than version 4.5, unsupported compression methods, unsafe member
+paths, and duplicate ambiguous member names.
 
-Issue #7 keeps acceptance staged. The deterministic local ZIP fixture is stage
-1; the fake Drive HTTP Range transport executed by the pinned Grease runtime is
-stage 2. Neither is evidence for authenticated Drive inventory, live extraction,
-retry/resume, or the 7.75 GB Takeout archive; those remain stages 3–7.
+Issue #7 keeps acceptance staged. The deterministic local fixture now covers
+both classic ZIP and a sparse 5 GiB ZIP64 archive; the fake Drive HTTP Range
+transport executed by the pinned Grease runtime covers both paths. These remain
+stages 1 and 2 only. They are not evidence for authenticated Drive inventory,
+live extraction, retry/resume, or the 7.75 GB Takeout archive; those remain
+stages 3–7.
 
 ## Provider boundary
 
