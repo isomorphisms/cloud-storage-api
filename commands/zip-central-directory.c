@@ -433,6 +433,7 @@ static void command_list(int argc, char **argv) {
         const unsigned char *p = data + pos;
         if (le32(p) != CENTRAL_SIG) die("unexpected record in central directory");
 
+        uint16_t version_needed = le16(p + 6);
         uint16_t flags = le16(p + 8);
         uint16_t method = le16(p + 10);
         uint32_t crc = le32(p + 16);
@@ -449,6 +450,8 @@ static void command_list(int argc, char **argv) {
         const unsigned char *name = p + 46;
         const unsigned char *extra = name + name_len;
 
+        if (version_needed > 45)
+            die("ZIP member requires extraction features newer than version 4.5");
         if (flags & 0x0001) die("encrypted ZIP members are unsupported");
         if (method != 0 && method != 8)
             die("ZIP member compression method is unsupported");

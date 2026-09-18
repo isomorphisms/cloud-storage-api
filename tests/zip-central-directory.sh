@@ -31,6 +31,10 @@ write_zip(os.path.join(root,'zip64-marker.zip'), [('x.txt',b'x',0)])
 b=bytearray(open(os.path.join(root,'zip64-marker.zip'),'rb').read()); pos=b.rfind(b'PK\x05\x06'); struct.pack_into('<I',b,pos+16,0xffffffff); open(os.path.join(root,'zip64-marker.zip'),'wb').write(b)
 write_zip(os.path.join(root,'nul-name.zip'), [('abc.txt',b'x',0)])
 b=bytearray(open(os.path.join(root,'nul-name.zip'),'rb').read()); pos=b.find(b'PK\x01\x02'); b[pos+46]=0; open(os.path.join(root,'nul-name.zip'),'wb').write(b)
+write_zip(os.path.join(root,'newer-version.zip'), [('x.txt', b'x', 0)])
+b=bytearray(open(os.path.join(root,'newer-version.zip'),'rb').read())
+pos=b.find(b'PK\x01\x02'); struct.pack_into('<H', b, pos + 6, 46)
+open(os.path.join(root,'newer-version.zip'),'wb').write(b)
 
 # Valid sparse ZIP64 fixture: central directory starts at 5 GiB and the member
 # sizes are also 5 GiB, but sparse storage keeps the fixture cheap.
@@ -113,6 +117,7 @@ reject "$temporary/duplicate.zip" 'duplicate ZIP member names'
 reject "$temporary/unsupported.zip" 'compression method is unsupported'
 reject "$temporary/zip64-marker.zip" 'ZIP64 end-of-central-directory locator is missing'
 reject "$temporary/nul-name.zip" 'member name contains NUL'
+reject "$temporary/newer-version.zip" 'newer than version 4.5'
 
 : > "$temporary/empty.bin"
 if $helper list 0 67108865 1 "$temporary/empty.bin" >/dev/null 2>"$temporary/bound.err"; then
