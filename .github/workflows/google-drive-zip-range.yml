@@ -1,0 +1,122 @@
+name: Google Drive ZIP range inventory
+
+on:
+  pull_request:
+    paths:
+      - AGENTS.md
+      - README.md
+      - commands/google-drive-zip-inventory.grease
+      - commands/zip-central-directory.c
+      - tests/zip-central-directory.sh
+      - tests/google-drive-zip-inventory.sh
+      - .github/workflows/google-drive-zip-range.yml
+  push:
+    branches: [main]
+    paths:
+      - AGENTS.md
+      - README.md
+      - commands/google-drive-zip-inventory.grease
+      - commands/zip-central-directory.c
+      - tests/zip-central-directory.sh
+      - tests/google-drive-zip-inventory.sh
+      - .github/workflows/google-drive-zip-range.yml
+
+concurrency:
+  group: google-drive-zip-range-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GREASE_SOURCE_REVISION: 8052868773077602266d80bf39aad6998e2da749
+
+jobs:
+  stage-1-local-zip-range:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Exercise deterministic local ZIP range fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP_CENTRAL_DIRECTORY_SOURCE="$PWD/commands/zip-central-directory.c" \
+            sh tests/zip-central-directory.sh
+
+      - name: State stage 1 evidence boundary
+        shell: sh
+        run: |
+          printf '%s\n' \
+            'PASS stage 1: deterministic local ZIP tail/central-directory parsing and rejection policy only; no Drive or Grease claim.'
+
+  stage-2-fake-drive-grease:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: python:2.7.18-buster@sha256:c934af72b8bd03b9804d5bde2569c320926e70392d708d113a2e71bcf98c8a20
+    steps:
+      - name: Check out cloud storage commands
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Check out exact Grease source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: isomorphisms/oils
+          ref: ${{ env.GREASE_SOURCE_REVISION }}
+          path: grease-source
+          persist-credentials: false
+
+      - name: Build helper and exact Grease development runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C grease-source rev-parse HEAD)" = "$GREASE_SOURCE_REVISION"
+          cc --version
+          mkdir -p _/test-bin
+          cc -std=c99 -Wall -Wextra -Werror -O2 \
+            commands/zip-central-directory.c \
+            -o _/test-bin/zip-central-directory
+          (cd grease-source && build/py.sh minimal)
+          grease-source/bin/osh -c 'x=hello; ⟦ -n "$x" ∧ ¬ "$x" = no ⟧ ∧ echo grease-runtime-ready'
+
+      - name: Install pinned jq for the Grease contract
+        shell: bash
+        env:
+          JQ_URL: https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-linux-amd64
+          JQ_SHA256: 020468de7539ce70ef1bceaf7cde2e8c4f2ca6c3afb84642aabc5c97d9fc2a0d
+        run: |
+          set -euo pipefail
+          python2 - <<'PY'
+          import hashlib
+          import os
+          import urllib2
+
+          url = os.environ['JQ_URL']
+          expected = os.environ['JQ_SHA256']
+          path = '_/test-bin/jq'
+          data = urllib2.urlopen(url).read()
+          actual = hashlib.sha256(data).hexdigest()
+          if actual != expected:
+              raise SystemExit('jq SHA-256 mismatch: %s' % actual)
+          with open(path, 'wb') as output:
+              output.write(data)
+          PY
+          chmod +x _/test-bin/jq
+          test "$(_/test-bin/jq --version)" = jq-1.8.1
+
+      - name: Exercise fake Drive Range transport through Grease
+        shell: bash
+        run: |
+          set -euo pipefail
+          PATH="$PWD/_/test-bin:$PATH" \
+          GREASE="$PWD/grease-source/bin/osh" \
+          ZIP_CENTRAL_DIRECTORY="$PWD/_/test-bin/zip-central-directory" \
+          PYTHON_FOR_FIXTURE=python2 \
+            sh tests/google-drive-zip-inventory.sh
+
+      - name: State stage 2 evidence boundary
+        shell: sh
+        run: |
+          printf '%s\n' \
+            'PASS stage 2: exact pinned Grease with fake Drive metadata and bounded HTTP Range transport; not authenticated Drive acceptance.'

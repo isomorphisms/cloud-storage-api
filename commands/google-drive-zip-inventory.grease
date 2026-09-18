@@ -1,0 +1,278 @@
+#!/usr/bin/env grease
+set -eu
+LC_ALL=C
+export LC_ALL
+
+script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+api_command=$script_directory/google-drive-api.grease
+zip_indexer=${ZIP_CENTRAL_DIRECTORY:-zip-central-directory}
+
+usage() {
+    cat <<'USAGE'
+usage:
+  google-drive-zip-inventory FILE [--exact MEMBER | --prefix PREFIX | --glob GLOB]
+
+List members of a large ZIP stored in Google Drive without downloading the
+complete archive. Output is NDJSON: one archive record followed by selected
+member records.
+
+FILE may be a raw Drive file ID or an ordinary Drive URL.
+
+The command performs only bounded reads:
+  1. metadata through drive.files.get;
+  2. at most 65,557 bytes from the archive tail;
+  3. exactly the classic ZIP central-directory range.
+
+ZIP64, multi-disk archives, encrypted members, unsupported compression methods,
+unsafe paths, and duplicate member names are rejected. The current accepted
+compression methods are stored (0) and deflate (8).
+
+Selection is optional and happens after validating the complete central
+directory. At most one selector may be supplied:
+  --exact MEMBER
+  --prefix PREFIX
+  --glob GLOB
+
+Environment:
+  GOOGLE_ACCESS_TOKEN / GOOGLE_ACCESS_TOKEN_FILE
+  GOOGLE_DRIVE_RESOURCE_KEYS
+      Same authentication/resource-key boundary as google-drive-api.
+
+  ZIP_CENTRAL_DIRECTORY
+      Path to the compiled zip-central-directory helper. If unset, it is looked
+      up in PATH.
+
+This command inventories only. It does not extract, upload, delete, or mutate
+Drive content.
+USAGE
+}
+
+fail() {
+    printf '%s\n' "$*" >&2
+    exit 2
+}
+
+need_command() {
+    command -v "$1" >/dev/null 2>&1 ∨ {
+        printf 'google-drive-zip-inventory needs %s\n' "$1" >&2
+        exit 127
+    }
+}
+
+require_bounded_curl() {
+    version=$(curl --version | sed -n '1s/^curl \([0-9][0-9.]*\).*/\1/p')
+    [ -n "$version" ] || fail 'cannot determine curl version'
+    major=${version%%.*}
+    remainder=${version#*.}
+    minor=${remainder%%.*}
+    case $major:$minor in
+        *[!0-9:]*|:*) fail "cannot parse curl version: $version" ;;
+    esac
+    if [ "$major" -lt 8 ] || { [ "$major" -eq 8 ] && [ "$minor" -lt 4 ]; }; then
+        fail "google-drive-zip-inventory needs curl 8.4 or newer for a hard running-transfer size bound (found $version)"
+    fi
+}
+
+drive_id() {
+    value=$1
+    case $value in
+        *'/d/'*)
+            value=${value#*/d/}
+            value=${value%%/*}
+            ;;
+        *'/folders/'*)
+            value=${value#*/folders/}
+            value=${value%%/*}
+            ;;
+        *'id='*)
+            value=${value#*id=}
+            value=${value%%&*}
+            ;;
+    esac
+    value=${value%%\?*}
+    value=${value%%\#*}
+    [ -n "$value" ] || fail 'empty Google Drive id'
+    printf '%s\n' "$value"
+}
+
+run_api() {
+    if [ -n "${GREASE:-}" ]; then
+        "$GREASE" "$api_command" "$@"
+    else
+        "$api_command" "$@"
+    fi
+}
+
+require_token() {
+    token=${GOOGLE_ACCESS_TOKEN:-}
+    if ⟦ -z "$token" ∧ -n "${GOOGLE_ACCESS_TOKEN_FILE:-}" ⟧; then
+        token=$(cat -- "$GOOGLE_ACCESS_TOKEN_FILE")
+    fi
+    [ -n "$token" ] || fail 'set GOOGLE_ACCESS_TOKEN or GOOGLE_ACCESS_TOKEN_FILE'
+}
+
+prepare_ranges() {
+    need_command curl
+    need_command jq
+    require_bounded_curl
+    need_command "$zip_indexer"
+    require_token
+
+    temporary_root=${TMPDIR:-/tmp}
+    mkdir -p "$temporary_root"
+    temporary=$(mktemp -d "$temporary_root/cloud-storage-zip-range.XXXXXX")
+    curl_config=$temporary/curl.conf
+    cleanup() { rm -rf "$temporary"; }
+    trap cleanup EXIT HUP INT TERM
+
+    umask 077
+    printf 'header = "Authorization: Bearer %s"\n' "$token" > "$curl_config"
+    if [ -n "${GOOGLE_DRIVE_RESOURCE_KEYS:-}" ]; then
+        printf 'header = "X-Goog-Drive-Resource-Keys: %s"\n' \
+            "$GOOGLE_DRIVE_RESOURCE_KEYS" >> "$curl_config"
+    fi
+}
+
+fetch_range() {
+    start=$1
+    end=$2
+    length=$3
+    output=$4
+    headers=$5
+
+    curl \
+        --config "$curl_config" \
+        --fail \
+        --silent \
+        --show-error \
+        --request GET \
+        --header "Range: bytes=$start-$end" \
+        --dump-header "$headers" \
+        --max-filesize "$length" \
+        --output "$output" \
+        "https://www.googleapis.com/drive/v3/files/$file_id?alt=media&supportsAllDrives=true"
+
+    grep -E '^HTTP/[0-9.]+ 206([[:space:]]|$)' "$headers" >/dev/null ∨
+        fail "Drive range request did not return HTTP 206 for bytes=$start-$end"
+    tr -d '\r' < "$headers" | grep -Fxi "Content-Range: bytes $start-$end/$source_size" >/dev/null ∨
+        fail "Drive range response did not confirm exactly bytes $start-$end/$source_size"
+}
+
+case ${1:-} in
+    -h|--help|'')
+        usage
+        exit 0
+        ;;
+esac
+
+file_id=$(drive_id "$1")
+shift
+selection_option=
+selection_value=
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --exact|--prefix|--glob)
+            [ "$#" -ge 2 ] || fail "$1 needs a value"
+            [ -z "$selection_option" ] || fail 'choose only one of --exact, --prefix, or --glob'
+            selection_option=$1
+            selection_value=$2
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            fail "unknown option: $1"
+            ;;
+    esac
+done
+
+metadata=$(run_api drive.files.get \
+    --path "fileId=$file_id" \
+    --query 'supportsAllDrives=true' \
+    --query 'fields=id,name,size,sha256Checksum,mimeType,capabilities(canDownload)')
+
+source_id=$(printf '%s' "$metadata" | jq -er '.id | strings | select(length > 0)') ||
+    fail 'Drive metadata has no file id'
+source_name=$(printf '%s' "$metadata" | jq -er '.name | strings') ||
+    fail 'Drive metadata has no file name'
+source_size=$(printf '%s' "$metadata" | jq -er '.size | strings | select(test("^[0-9]+$"))') ||
+    fail 'Drive metadata has no byte size'
+source_sha256=$(printf '%s' "$metadata" | jq -r '.sha256Checksum // ""')
+source_mime=$(printf '%s' "$metadata" | jq -r '.mimeType // ""')
+printf '%s' "$metadata" | jq -e '.capabilities.canDownload == true' >/dev/null ∨
+    fail 'Drive metadata says this file cannot be downloaded'
+[ "$source_id" = "$file_id" ] || fail 'Drive metadata id does not match requested file id'
+
+prepare_ranges
+
+tab=$(printf '\t')
+tail_spec=$($zip_indexer tail "$source_size")
+IFS="$tab" read -r tail_start tail_end tail_length <<EOF_TAIL
+$tail_spec
+EOF_TAIL
+
+tail_file=$temporary/tail.bin
+tail_headers=$temporary/tail.headers
+fetch_range "$tail_start" "$tail_end" "$tail_length" "$tail_file" "$tail_headers"
+
+eocd=$($zip_indexer eocd "$source_size" "$tail_start" "$tail_file")
+IFS="$tab" read -r central_start central_end central_size member_count eocd_offset <<EOF_EOCD
+$eocd
+EOF_EOCD
+
+central_file=$temporary/central-directory.bin
+if [ "$central_size" = 0 ]; then
+    : > "$central_file"
+else
+    central_headers=$temporary/central.headers
+    fetch_range "$central_start" "$central_end" "$central_size" "$central_file" "$central_headers"
+fi
+
+members_file=$temporary/members.ndjson
+if [ -n "$selection_option" ]; then
+    "$zip_indexer" list "$central_start" "$central_size" "$member_count" \
+        "$selection_option" "$selection_value" "$central_file" > "$members_file"
+else
+    "$zip_indexer" list "$central_start" "$central_size" "$member_count" \
+        "$central_file" > "$members_file"
+fi
+selected_member_count=$(wc -l < "$members_file" | tr -d '[:space:]')
+
+# Emit nothing until the complete central directory has passed validation.
+jq -cn \
+    --arg file_id "$source_id" \
+    --arg name "$source_name" \
+    --arg size "$source_size" \
+    --arg sha256 "$source_sha256" \
+    --arg mime_type "$source_mime" \
+    --arg tail_start "$tail_start" \
+    --arg tail_end "$tail_end" \
+    --arg central_start "$central_start" \
+    --arg central_end "$central_end" \
+    --arg central_size "$central_size" \
+    --arg member_count "$member_count" \
+    --arg selected_member_count "$selected_member_count" \
+    --arg eocd_offset "$eocd_offset" \
+    '{
+        kind: "archive",
+        provider: "google-drive",
+        file_id: $file_id,
+        name: $name,
+        size: ($size | tonumber),
+        sha256_checksum: (if $sha256 == "" then null else $sha256 end),
+        mime_type: $mime_type,
+        range_reads: {
+            tail: {start: ($tail_start | tonumber), end: ($tail_end | tonumber)},
+            central_directory: {
+                start: ($central_start | tonumber),
+                end: ($central_end | tonumber),
+                size: ($central_size | tonumber)
+            }
+        },
+        eocd_offset: ($eocd_offset | tonumber),
+        member_count: ($member_count | tonumber),
+        selected_member_count: ($selected_member_count | tonumber)
+    }'
+cat "$members_file"

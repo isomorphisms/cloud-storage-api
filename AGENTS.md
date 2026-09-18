@@ -70,6 +70,35 @@ Whenever giving the human a script or command block, assume `$PWD` is arbitrary.
 - Avoid designs that require holding a complete large archive plus all extracted members in RAM.
 - Do not delete the source archive as part of an extraction workflow until the intended destination state has been verified.
 
+
+### Large ZIP ranged inventory
+
+- Keep the existing Apps Script `Utilities.unzip()` path scoped to ordinary
+  archives. Its source/compatibility receipts are never evidence for the
+  large-archive ranged path.
+- Grease owns provider identity, authentication, metadata, and HTTP Range
+  orchestration. The small C ZIP helper owns binary structure parsing and
+  64-bit archive-offset arithmetic only; it must not grow provider/network I/O.
+- Inventory must not download the complete archive. Bound the tail read to the
+  classic EOCD maximum, then fetch exactly the central-directory range.
+- Require HTTP 206 and an exact `Content-Range` for every Drive range read.
+  Keep a hard maximum response size so an ignored Range header cannot become a
+  silent whole-file download. The current curl implementation requires 8.4 or
+  newer because that is the boundary where `--max-filesize` gains an active
+  running-transfer limit for responses whose size was not known up front.
+- Do not do multi-gigabyte ZIP offset arithmetic in shell expressions; keep it
+  in the fixed-width C boundary so ARMv7 does not become a hidden exception.
+- Validate the complete central directory before writing a successful inventory
+  to stdout. Reject unsafe paths, duplicate ambiguous names, encryption,
+  unsupported compression, multi-disk archives, and ZIP64 until those cases
+  have explicit implementations and tests.
+- Keep issue #7 acceptance stages independent: (1) deterministic local range
+  fixture, (2) fake Drive ranged transport under Grease, (3) live authenticated
+  ranged inventory, (4) live bounded-member extraction, (5) live multi-member
+  retry/resume, (6) 7.75 GB Takeout inventory without full client download, and
+  (7) selected Takeout extraction. Never promote local/fake evidence into a
+  later live stage.
+
 ## Synchronization
 
 - Use Drive change-page tokens as protocol cursors, not as substitutes for durable local state.
