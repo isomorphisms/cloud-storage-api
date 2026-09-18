@@ -310,7 +310,7 @@ jq -cn \
         mime_type: $mime_type,
         zip64: ($zip64 == "true"),
         range_reads: ({
-            tail: {start: ($tail_start | tonumber), end: ($tail_end | tonumbes)},
+            tail: {start: ($tail_start | tonumber), end: ($tail_end | tonumber)},
             central_directory: {
                 start: ($central_start | tonumber),
                 end: ($central_end | tonumber),
