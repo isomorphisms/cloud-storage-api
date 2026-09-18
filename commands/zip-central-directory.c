@@ -81,10 +81,10 @@ static int valid_utf8(const unsigned char *s, size_t n) {
         unsigned char c = s[i++];
         if (c < 0x80) continue;
         int need;
-        uint32_t code;
-        if ((c & 0xe0) == 0xc0) { need = 1; code = c & 0x1f; if (code < 2) return 0; }
-        else if ((c & 0xf0) == 0xe0) { need = 2; code = c & 0x0f; }
-        else if ((c & 0xf8) == 0xf0) { need = 3; code = c & 0x07; if (code > 4) return 0; }
+        uint32_t code, minimum;
+        if ((c & 0xe0) == 0xc0) { need = 1; code = c & 0x1f; minimum = 0x80; }
+        else if ((c & 0xf0) == 0xe0) { need = 2; code = c & 0x0f; minimum = 0x800; }
+        else if ((c & 0xf8) == 0xf0) { need = 3; code = c & 0x07; minimum = 0x10000; if (code > 4) return 0; }
         else return 0;
         if (i + (size_t)need > n) return 0;
         while (need--) {
@@ -92,7 +92,7 @@ static int valid_utf8(const unsigned char *s, size_t n) {
             if ((d & 0xc0) != 0x80) return 0;
             code = (code << 6) | (d & 0x3f);
         }
-        if (code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return 0;
+        if (code < minimum || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return 0;
     }
     return 1;
 }
@@ -100,6 +100,8 @@ static int valid_utf8(const unsigned char *s, size_t n) {
 static void validate_name(const unsigned char *name, size_t n, uint16_t flags) {
     if (!n) die("ZIP member has an empty name");
     if (name[0] == '/' || name[0] == '\\') die("ZIP member has an absolute path");
+    for (size_t i = 0; i < n; ++i)
+        if (name[i] == 0) die("ZIP member name contains NUL");
     if (!(flags & 0x0800)) {
         for (size_t i = 0; i < n; ++i)
             if (name[i] >= 0x80) die("ZIP member uses unsupported non-UTF-8 filename encoding");
@@ -286,6 +288,7 @@ static void command_list(int argc, char **argv) {
         if (compressed == 0xffffffffu || uncompressed == 0xffffffffu || local_offset == 0xffffffffu || disk_start == 0xffffu || has_zip64_extra(extra, extra_len))
             die("ZIP64 members are unsupported");
         if (disk_start != 0) die("multi-disk ZIP members are unsupported");
+        if ((uint64_t)local_offset >= central_offset) die("ZIP member local header does not precede central directory");
         validate_name(name, name_len, flags);
 
         entries[count].name = malloc((size_t)name_len + 1);

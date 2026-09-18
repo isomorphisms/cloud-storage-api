@@ -83,7 +83,9 @@ Whenever giving the human a script or command block, assume `$PWD` is arbitrary.
   classic EOCD maximum, then fetch exactly the central-directory range.
 - Require HTTP 206 and an exact `Content-Range` for every Drive range read.
   Keep a hard maximum response size so an ignored Range header cannot become a
-  silent whole-file download.
+  silent whole-file download. The current curl implementation requires 8.4 or
+  newer because that is the boundary where `--max-filesize` gains an active
+  running-transfer limit for responses whose size was not known up front.
 - Do not do multi-gigabyte ZIP offset arithmetic in shell expressions; keep it
   in the fixed-width C boundary so ARMv7 does not become a hidden exception.
 - Validate the complete central directory before writing a successful inventory

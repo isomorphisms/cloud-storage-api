@@ -91,7 +91,9 @@ then performs at most two bounded byte-range reads for inventory:
 The command requires HTTP 206 and an exact `Content-Range` matching the
 requested interval and Drive's metadata size. Each curl transfer also has a hard
 maximum response size, so a server that ignores `Range` cannot quietly turn an
-inventory request into a full-archive download.
+inventory request into a full-archive download. The command requires curl 8.4
+or newer because earlier curl releases did not enforce `--max-filesize` as a
+running-transfer limit when the response size was not known up front.
 
 `commands/zip-central-directory.c` is deliberately narrower than a ZIP
 library. Grease owns Drive identity, authentication, metadata, and ranged

@@ -41,6 +41,11 @@ set -eu
 : "${FAKE_RANGE_LOG:?}"
 : "${FAKE_ARGV_LOG:?}"
 
+if [ "${1:-}" = --version ]; then
+    printf 'curl %s fake\n' "${FAKE_CURL_VERSION:-8.5.0}"
+    exit 0
+fi
+
 {
     printf '%s\n' '=== curl ==='
     for argument in "$@"; do printf '%s\n' "$argument"; done
@@ -71,7 +76,7 @@ done
 
 case $url in
     *'/drive/v3/files/ZIP123?'*'fields='*)
-        printf '{"id":"ZIP123","name":"takeout.zip","size":"%s","sha256Checksum":"FIXTURESHA","mimeType":"application/zip"}\n' "$FAKE_ZIP_SIZE"
+        printf '{"id":"ZIP123","name":"takeout.zip","size":"%s","sha256Checksum":"FIXTURESHA","mimeType":"application/zip","capabilities":{"canDownload":%s}}\n' "$FAKE_ZIP_SIZE" "${FAKE_CAN_DOWNLOAD:-true}"
         ;;
     *'/drive/v3/files/ZIP123?alt=media&supportsAllDrives=true')
         [ -n "$range" ] || {
@@ -159,7 +164,33 @@ then
     printf '%s\n' 'wrong Content-Range unexpectedly accepted' >&2
     exit 1
 fi
-grep -F 'did not confirm bytes' "$temporary/content-range.err" >/dev/null
+grep -F 'did not confirm exactly bytes' "$temporary/content-range.err" >/dev/null
+
+if PATH=$fake_bin:$PATH \
+   GOOGLE_ACCESS_TOKEN=SECRET_TOKEN_VALUE \
+   FAKE_ZIP=$archive FAKE_ZIP_SIZE=$archive_size \
+   FAKE_RANGE_LOG=$range_log FAKE_ARGV_LOG=$argv_log \
+   FAKE_CURL_VERSION=8.3.0 \
+   ZIP_CENTRAL_DIRECTORY=$ZIP_CENTRAL_DIRECTORY GREASE=$GREASE \
+       "$GREASE" "$client" ZIP123 >/dev/null 2>"$temporary/curl-version.err"
+then
+    printf '%s\n' 'old curl unexpectedly accepted for bounded inventory' >&2
+    exit 1
+fi
+grep -F 'needs curl 8.4 or newer' "$temporary/curl-version.err" >/dev/null
+
+if PATH=$fake_bin:$PATH \
+   GOOGLE_ACCESS_TOKEN=SECRET_TOKEN_VALUE \
+   FAKE_ZIP=$archive FAKE_ZIP_SIZE=$archive_size \
+   FAKE_RANGE_LOG=$range_log FAKE_ARGV_LOG=$argv_log \
+   FAKE_CAN_DOWNLOAD=false \
+   ZIP_CENTRAL_DIRECTORY=$ZIP_CENTRAL_DIRECTORY GREASE=$GREASE \
+       "$GREASE" "$client" ZIP123 >/dev/null 2>"$temporary/can-download.err"
+then
+    printf '%s\n' 'canDownload=false unexpectedly accepted' >&2
+    exit 1
+fi
+grep -F 'cannot be downloaded' "$temporary/can-download.err" >/dev/null
 
 printf 'archive_size=%s fetched=%s\n' "$archive_size" "$fetched"
 printf '%s\n' 'fake Drive bounded-range inventory passes under Grease'

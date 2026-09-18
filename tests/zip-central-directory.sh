@@ -36,6 +36,11 @@ write_zip(os.path.join(root,'zip64-marker.zip'), [('x.txt', b'x', 0)])
 b=bytearray(open(os.path.join(root,'zip64-marker.zip'),'rb').read())
 pos=b.rfind(b'PK\x05\x06'); struct.pack_into('<I', b, pos + 16, 0xffffffff)
 open(os.path.join(root,'zip64-marker.zip'),'wb').write(b)
+
+write_zip(os.path.join(root,'nul-name.zip'), [('abc.txt', b'x', 0)])
+b=bytearray(open(os.path.join(root,'nul-name.zip'),'rb').read())
+pos=b.find(b'PK\x01\x02'); b[pos + 46] = 0
+open(os.path.join(root,'nul-name.zip'),'wb').write(b)
 PY
 
 range_parts() {
@@ -84,5 +89,6 @@ reject "$temporary/traversal.zip" 'path traversal'
 reject "$temporary/duplicate.zip" 'duplicate ZIP member names'
 reject "$temporary/unsupported.zip" 'compression method is unsupported'
 reject "$temporary/zip64-marker.zip" 'ZIP64 archives are unsupported'
+reject "$temporary/nul-name.zip" 'member name contains NUL'
 
 printf '%s\n' 'deterministic bounded ZIP central-directory fixture passes'

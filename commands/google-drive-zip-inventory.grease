@@ -59,6 +59,20 @@ need_command() {
     }
 }
 
+require_bounded_curl() {
+    version=$(curl --version | sed -n '1s/^curl \([0-9][0-9.]*\).*/\1/p')
+    [ -n "$version" ] || fail 'cannot determine curl version'
+    major=${version%%.*}
+    remainder=${version#*.}
+    minor=${remainder%%.*}
+    case $major:$minor in
+        *[!0-9:]*|:*) fail "cannot parse curl version: $version" ;;
+    esac
+    if [ "$major" -lt 8 ] || { [ "$major" -eq 8 ] && [ "$minor" -lt 4 ]; }; then
+        fail "google-drive-zip-inventory needs curl 8.4 or newer for a hard running-transfer size bound (found $version)"
+    fi
+}
+
 drive_id() {
     value=$1
     case $value in
@@ -100,6 +114,7 @@ require_token() {
 prepare_ranges() {
     need_command curl
     need_command jq
+    require_bounded_curl
     need_command "$zip_indexer"
     require_token
 
@@ -139,8 +154,8 @@ fetch_range() {
 
     grep -E '^HTTP/[0-9.]+ 206([[:space:]]|$)' "$headers" >/dev/null ∨
         fail "Drive range request did not return HTTP 206 for bytes=$start-$end"
-    grep -Fi "Content-Range: bytes $start-$end/$source_size" "$headers" >/dev/null ∨
-        fail "Drive range response did not confirm bytes $start-$end/$source_size"
+    tr -d '\r' < "$headers" | grep -Fxi "Content-Range: bytes $start-$end/$source_size" >/dev/null ∨
+        fail "Drive range response did not confirm exactly bytes $start-$end/$source_size"
 }
 
 case ${1:-} in
@@ -176,7 +191,7 @@ done
 metadata=$(run_api drive.files.get \
     --path "fileId=$file_id" \
     --query 'supportsAllDrives=true' \
-    --query 'fields=id,name,size,sha256Checksum,mimeType')
+    --query 'fields=id,name,size,sha256Checksum,mimeType,capabilities(canDownload)')
 
 source_id=$(printf '%s' "$metadata" | jq -er '.id | strings | select(length > 0)') ||
     fail 'Drive metadata has no file id'
@@ -186,6 +201,8 @@ source_size=$(printf '%s' "$metadata" | jq -er '.size | strings | select(test("^
     fail 'Drive metadata has no byte size'
 source_sha256=$(printf '%s' "$metadata" | jq -r '.sha256Checksum // ""')
 source_mime=$(printf '%s' "$metadata" | jq -r '.mimeType // ""')
+printf '%s' "$metadata" | jq -e '.capabilities.canDownload == true' >/dev/null ∨
+    fail 'Drive metadata says this file cannot be downloaded'
 [ "$source_id" = "$file_id" ] || fail 'Drive metadata id does not match requested file id'
 
 prepare_ranges
