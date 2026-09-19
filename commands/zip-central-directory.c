@@ -1,5 +1,5 @@
 /*
- * Classic ZIP central-directory parser for the Grease ranged-Drive path.
+ * ZIP / ZIP64 central-directory parser for the Grease ranged-Drive path.
  * It never performs network I/O or extraction: Grease supplies bounded byte
  * ranges, and this helper validates/parses only those local slices.
  */
@@ -11,7 +11,12 @@
 #include <string.h>
 
 #define EOCD_SIG 0x06054b50u
+#define ZIP64_EOCD_SIG 0x06064b50u
+#define ZIP64_LOCATOR_SIG 0x07064b50u
 #define CENTRAL_SIG 0x02014b50u
+#define ZIP64_EXTRA 0x0001u
+#define MAX_CENTRAL_DIRECTORY_BYTES (64u * 1024u * 1024u)
+#define MAX_ENTRY_COUNT 1000000u
 
 typedef struct {
     char *name;
@@ -19,9 +24,9 @@ typedef struct {
     uint16_t flags;
     uint16_t method;
     uint32_t crc32;
-    uint32_t compressed_size;
-    uint32_t uncompressed_size;
-    uint32_t local_header_offset;
+    uint64_t compressed_size;
+    uint64_t uncompressed_size;
+    uint64_t local_header_offset;
     uint64_t central_record_offset;
     int directory;
 } Entry;
@@ -45,6 +50,13 @@ static uint32_t le32(const unsigned char *p) {
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+static uint64_t le64(const unsigned char *p) {
+    return (uint64_t)p[0] | ((uint64_t)p[1] << 8) |
+           ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
+           ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
+           ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
+}
+
 static uint64_t parse_u64(const char *text, const char *what) {
     char *end = NULL;
     errno = 0;
@@ -54,6 +66,13 @@ static uint64_t parse_u64(const char *text, const char *what) {
         exit(2);
     }
     return (uint64_t)value;
+}
+
+static void bounded_directory(uint64_t size, uint64_t count) {
+    if (size > MAX_CENTRAL_DIRECTORY_BYTES)
+        die("ZIP central directory exceeds the 64 MiB inventory bound");
+    if (count > MAX_ENTRY_COUNT)
+        die("ZIP entry count exceeds the inventory bound");
 }
 
 static unsigned char *read_file(const char *path, size_t *length) {
@@ -108,6 +127,7 @@ static void validate_name(const unsigned char *name, size_t n, uint16_t flags) {
     } else if (!valid_utf8(name, n)) {
         die("ZIP member has invalid UTF-8 name");
     }
+
     size_t segment_start = 0;
     for (size_t i = 0; i <= n; ++i) {
         if (i < n && name[i] == '\\') die("ZIP member name contains backslash");
@@ -123,18 +143,60 @@ static void validate_name(const unsigned char *name, size_t n, uint16_t flags) {
         die("ZIP member has a drive-letter path");
 }
 
-static int has_zip64_extra(const unsigned char *extra, size_t n) {
+static void resolve_zip64_extra(const unsigned char *extra, size_t n,
+                                uint32_t compressed32, uint32_t uncompressed32,
+                                uint32_t local_offset32, uint16_t disk_start16,
+                                uint64_t *compressed, uint64_t *uncompressed,
+                                uint64_t *local_offset, uint32_t *disk_start) {
+    int need_uncompressed = uncompressed32 == 0xffffffffu;
+    int need_compressed = compressed32 == 0xffffffffu;
+    int need_offset = local_offset32 == 0xffffffffu;
+    int need_disk = disk_start16 == 0xffffu;
+    int need_zip64 = need_uncompressed || need_compressed || need_offset || need_disk;
+    int saw_zip64 = 0;
+
+    *uncompressed = uncompressed32;
+    *compressed = compressed32;
+    *local_offset = local_offset32;
+    *disk_start = disk_start16;
+
     size_t pos = 0;
     while (pos + 4 <= n) {
         uint16_t tag = le16(extra + pos);
         uint16_t size = le16(extra + pos + 2);
         pos += 4;
         if (pos + size > n) die("malformed ZIP extra field");
-        if (tag == 0x0001) return 1;
+
+        if (tag == ZIP64_EXTRA) {
+            if (saw_zip64) die("duplicate ZIP64 extended information extra field");
+            saw_zip64 = 1;
+            size_t z = 0;
+            const unsigned char *p = extra + pos;
+
+            if (need_uncompressed) {
+                if (z + 8 > size) die("truncated ZIP64 uncompressed size");
+                *uncompressed = le64(p + z); z += 8;
+            }
+            if (need_compressed) {
+                if (z + 8 > size) die("truncated ZIP64 compressed size");
+                *compressed = le64(p + z); z += 8;
+            }
+            if (need_offset) {
+                if (z + 8 > size) die("truncated ZIP64 local-header offset");
+                *local_offset = le64(p + z); z += 8;
+            }
+            if (need_disk) {
+                if (z + 4 > size) die("truncated ZIP64 disk-start number");
+                *disk_start = le32(p + z); z += 4;
+            }
+            if (z != size)
+                die("ZIP64 extended information contains fields not selected by sentinel values");
+        }
         pos += size;
     }
     if (pos != n) die("malformed ZIP extra field tail");
-    return 0;
+    if (need_zip64 && !saw_zip64)
+        die("ZIP64 sentinel field has no ZIP64 extended information");
 }
 
 static void json_string(const char *s, size_t n) {
@@ -188,10 +250,15 @@ static void command_tail(int argc, char **argv) {
     if (argc != 3) die("usage: zip-central-directory tail ARCHIVE_SIZE");
     uint64_t archive_size = parse_u64(argv[2], "archive size");
     if (!archive_size) die("ZIP archive is empty");
-    const uint64_t window = 65557;
+
+    /* EOCD (22) + max comment (65535) + ZIP64 locator (20). */
+    const uint64_t window = 65577;
     uint64_t start = archive_size > window ? archive_size - window : 0;
     uint64_t end = archive_size - 1;
-    printf("%llu\t%llu\t%llu\n", (unsigned long long)start, (unsigned long long)end, (unsigned long long)(end - start + 1));
+    printf("%llu\t%llu\t%llu\n",
+           (unsigned long long)start,
+           (unsigned long long)end,
+           (unsigned long long)(end - start + 1));
 }
 
 static void command_eocd(int argc, char **argv) {
@@ -217,27 +284,119 @@ static void command_eocd(int argc, char **argv) {
     uint16_t entries_total = le16(tail + found + 10);
     uint32_t central_size = le32(tail + found + 12);
     uint32_t central_offset = le32(tail + found + 16);
-    if (disk || central_disk || entries_disk != entries_total)
-        die("multi-disk ZIP archives are unsupported");
-    if (entries_total == 0xffffu || central_size == 0xffffffffu || central_offset == 0xffffffffu)
-        die("ZIP64 archives are unsupported");
-
     uint64_t eocd_offset = tail_start + found;
-    if ((uint64_t)central_offset + central_size > eocd_offset)
-        die("central directory overlaps end-of-central-directory");
-    uint64_t central_end = central_size ? (uint64_t)central_offset + central_size - 1 : central_offset;
-    printf("%u\t%llu\t%u\t%u\t%llu\n", central_offset,
-           (unsigned long long)central_end, central_size, entries_total,
+
+    int needs_zip64 = entries_disk == 0xffffu || entries_total == 0xffffu ||
+                      central_size == 0xffffffffu || central_offset == 0xffffffffu;
+
+    if (!needs_zip64) {
+        if (disk || central_disk || entries_disk != entries_total)
+            die("multi-disk ZIP archives are unsupported");
+        bounded_directory(central_size, entries_total);
+        if ((uint64_t)central_offset + central_size > eocd_offset)
+            die("central directory overlaps end-of-central-directory");
+        uint64_t central_end = central_size
+            ? (uint64_t)central_offset + central_size - 1
+            : central_offset;
+        printf("classic\t%u\t%llu\t%u\t%u\t%llu\n",
+               central_offset,
+               (unsigned long long)central_end,
+               central_size, entries_total,
+               (unsigned long long)eocd_offset);
+        free(tail);
+        return;
+    }
+
+    if (!((disk == 0) || (disk == 0xffffu)) ||
+        !((central_disk == 0) || (central_disk == 0xffffu)))
+        die("multi-disk ZIP64 archives are unsupported");
+    if (found < 20) die("ZIP64 locator is not present in bounded tail");
+
+    const unsigned char *locator = tail + found - 20;
+    if (le32(locator) != ZIP64_LOCATOR_SIG)
+        die("ZIP64 end-of-central-directory locator is missing");
+    uint32_t zip64_disk = le32(locator + 4);
+    uint64_t zip64_offset = le64(locator + 8);
+    uint32_t total_disks = le32(locator + 16);
+    if (zip64_disk != 0 || total_disks != 1)
+        die("multi-disk ZIP64 archives are unsupported");
+
+    uint64_t locator_offset = eocd_offset - 20;
+    if (zip64_offset >= locator_offset || locator_offset - zip64_offset < 56)
+        die("ZIP64 end-of-central-directory offset is invalid");
+
+    printf("zip64\t%llu\t%llu\t56\t%llu\t%llu\n",
+           (unsigned long long)zip64_offset,
+           (unsigned long long)(zip64_offset + 55),
+           (unsigned long long)locator_offset,
            (unsigned long long)eocd_offset);
     free(tail);
 }
 
+static void command_zip64_eocd(int argc, char **argv) {
+    if (argc != 6)
+        die("usage: zip-central-directory zip64-eocd ARCHIVE_SIZE RECORD_START LOCATOR_OFFSET RECORD_FILE");
+    uint64_t archive_size = parse_u64(argv[2], "archive size");
+    uint64_t record_start = parse_u64(argv[3], "ZIP64 EOCD offset");
+    uint64_t locator_offset = parse_u64(argv[4], "ZIP64 locator offset");
+    if (locator_offset >= archive_size || record_start >= locator_offset)
+        die("ZIP64 end-of-central-directory range is outside archive");
+
+    size_t n = 0;
+    unsigned char *record = read_file(argv[5], &n);
+    if (n != 56) die("ZIP64 end-of-central-directory fixed range must be 56 bytes");
+    if (le32(record) != ZIP64_EOCD_SIG)
+        die("ZIP64 end-of-central-directory signature is missing");
+
+    uint64_t remaining_size = le64(record + 4);
+    if (remaining_size < 44)
+        die("ZIP64 end-of-central-directory record is too short");
+    if (remaining_size > UINT64_MAX - 12 ||
+        record_start > UINT64_MAX - (remaining_size + 12))
+        die("ZIP64 end-of-central-directory size overflows");
+    uint64_t record_end_exclusive = record_start + remaining_size + 12;
+    if (record_end_exclusive != locator_offset)
+        die("ZIP64 end-of-central-directory does not end at its locator");
+
+    uint16_t version_needed = le16(record + 14);
+    if (version_needed > 45)
+        die("ZIP64 central-directory features newer than version 4.5 are unsupported");
+
+    uint32_t disk = le32(record + 16);
+    uint32_t central_disk = le32(record + 20);
+    uint64_t entries_disk = le64(record + 24);
+    uint64_t entries_total = le64(record + 32);
+    uint64_t central_size = le64(record + 40);
+    uint64_t central_offset = le64(record + 48);
+    if (disk != 0 || central_disk != 0 || entries_disk != entries_total)
+        die("multi-disk ZIP64 archives are unsupported");
+
+    bounded_directory(central_size, entries_total);
+    if (central_offset > record_start ||
+        central_size > record_start - central_offset)
+        die("ZIP64 central directory overlaps ZIP64 end-of-central-directory");
+    uint64_t central_end = central_size
+        ? central_offset + central_size - 1
+        : central_offset;
+
+    printf("%llu\t%llu\t%llu\t%llu\t%llu\n",
+           (unsigned long long)central_offset,
+           (unsigned long long)central_end,
+           (unsigned long long)central_size,
+           (unsigned long long)entries_total,
+           (unsigned long long)record_start);
+    free(record);
+}
+
 static void command_list(int argc, char **argv) {
-    if (argc < 6) die("usage: zip-central-directory list CENTRAL_OFFSET CENTRAL_SIZE ENTRY_COUNT [FILTERS] CENTRAL_FILE");
+    if (argc < 6)
+        die("usage: zip-central-directory list CENTRAL_OFFSET CENTRAL_SIZE ENTRY_COUNT [FILTERS] CENTRAL_FILE");
     uint64_t central_offset = parse_u64(argv[2], "central offset");
     uint64_t central_size64 = parse_u64(argv[3], "central size");
     uint64_t expected_count64 = parse_u64(argv[4], "entry count");
-    if (central_size64 > SIZE_MAX || expected_count64 > SIZE_MAX) die("central directory is too large for this build");
+    bounded_directory(central_size64, expected_count64);
+    if (central_size64 > SIZE_MAX || expected_count64 > SIZE_MAX)
+        die("central directory is too large for this build");
     size_t central_size = (size_t)central_size64;
     size_t expected_count = (size_t)expected_count64;
 
@@ -246,7 +405,9 @@ static void command_list(int argc, char **argv) {
     size_t filter_count = 0;
     int i = 5;
     while (i < argc - 1) {
-        if ((!strcmp(argv[i], "--exact") || !strcmp(argv[i], "--prefix") || !strcmp(argv[i], "--glob")) && i + 1 < argc - 1) {
+        if ((!strcmp(argv[i], "--exact") ||
+             !strcmp(argv[i], "--prefix") ||
+             !strcmp(argv[i], "--glob")) && i + 1 < argc - 1) {
             filters[filter_count].kind = argv[i] + 2;
             filters[filter_count].value = argv[i + 1];
             ++filter_count;
@@ -255,6 +416,7 @@ static void command_list(int argc, char **argv) {
             die("unknown or incomplete ZIP selection option");
         }
     }
+
     const char *path = argv[argc - 1];
     size_t n = 0;
     unsigned char *data = read_file(path, &n);
@@ -263,32 +425,47 @@ static void command_list(int argc, char **argv) {
     Entry *entries = calloc(expected_count ? expected_count : 1, sizeof(Entry));
     if (!entries) die("out of memory");
     size_t count = 0, pos = 0;
+
     while (pos < n) {
-        if (count >= expected_count) die("central directory contains more records than EOCD declares");
+        if (count >= expected_count)
+            die("central directory contains more records than EOCD declares");
         if (n - pos < 46) die("truncated central-directory record");
         const unsigned char *p = data + pos;
         if (le32(p) != CENTRAL_SIG) die("unexpected record in central directory");
+
+        uint16_t version_needed = le16(p + 6);
         uint16_t flags = le16(p + 8);
         uint16_t method = le16(p + 10);
         uint32_t crc = le32(p + 16);
-        uint32_t compressed = le32(p + 20);
-        uint32_t uncompressed = le32(p + 24);
+        uint32_t compressed32 = le32(p + 20);
+        uint32_t uncompressed32 = le32(p + 24);
         uint16_t name_len = le16(p + 28);
         uint16_t extra_len = le16(p + 30);
         uint16_t comment_len = le16(p + 32);
-        uint16_t disk_start = le16(p + 34);
-        uint32_t local_offset = le32(p + 42);
+        uint16_t disk_start16 = le16(p + 34);
+        uint32_t local_offset32 = le32(p + 42);
         size_t record_len = 46u + name_len + extra_len + comment_len;
         if (record_len > n - pos) die("truncated variable central-directory record");
+
         const unsigned char *name = p + 46;
         const unsigned char *extra = name + name_len;
 
+        if (version_needed > 45)
+            die("ZIP member requires extraction features newer than version 4.5");
         if (flags & 0x0001) die("encrypted ZIP members are unsupported");
-        if (method != 0 && method != 8) die("ZIP member compression method is unsupported");
-        if (compressed == 0xffffffffu || uncompressed == 0xffffffffu || local_offset == 0xffffffffu || disk_start == 0xffffu || has_zip64_extra(extra, extra_len))
-            die("ZIP64 members are unsupported");
+        if (method != 0 && method != 8)
+            die("ZIP member compression method is unsupported");
+
+        uint64_t compressed, uncompressed, local_offset;
+        uint32_t disk_start;
+        resolve_zip64_extra(extra, extra_len,
+                            compressed32, uncompressed32,
+                            local_offset32, disk_start16,
+                            &compressed, &uncompressed,
+                            &local_offset, &disk_start);
         if (disk_start != 0) die("multi-disk ZIP members are unsupported");
-        if ((uint64_t)local_offset >= central_offset) die("ZIP member local header does not precede central directory");
+        if (local_offset >= central_offset)
+            die("ZIP member local header does not precede central directory");
         validate_name(name, name_len, flags);
 
         entries[count].name = malloc((size_t)name_len + 1);
@@ -304,10 +481,12 @@ static void command_list(int argc, char **argv) {
         entries[count].local_header_offset = local_offset;
         entries[count].central_record_offset = central_offset + pos;
         entries[count].directory = name_len && name[name_len - 1] == '/';
+
         ++count;
         pos += record_len;
     }
-    if (count != expected_count) die("central directory entry count does not match EOCD");
+    if (count != expected_count)
+        die("central directory entry count does not match EOCD");
 
     Entry **sorted = malloc((count ? count : 1) * sizeof(Entry *));
     if (!sorted) die("out of memory");
@@ -322,21 +501,30 @@ static void command_list(int argc, char **argv) {
         if (!selected(e, filters, filter_count)) continue;
         fputs("{\"kind\":\"member\",\"path\":", stdout);
         json_string(e->name, e->name_len);
-        printf(",\"compressed_size\":%u,\"uncompressed_size\":%u,\"compression_method\":%u,\"crc32\":\"%08x\",\"general_purpose_flags\":%u,\"local_header_offset\":%u,\"central_directory_record_offset\":%llu,\"directory\":%s}\n",
-               e->compressed_size, e->uncompressed_size, e->method, e->crc32,
-               e->flags, e->local_header_offset,
+        printf(",\"compressed_size\":%llu,\"uncompressed_size\":%llu,"
+               "\"compression_method\":%u,\"crc32\":\"%08x\","
+               "\"general_purpose_flags\":%u,\"local_header_offset\":%llu,"
+               "\"central_directory_record_offset\":%llu,\"directory\":%s}\n",
+               (unsigned long long)e->compressed_size,
+               (unsigned long long)e->uncompressed_size,
+               e->method, e->crc32, e->flags,
+               (unsigned long long)e->local_header_offset,
                (unsigned long long)e->central_record_offset,
                e->directory ? "true" : "false");
     }
 
     for (size_t j = 0; j < count; ++j) free(entries[j].name);
-    free(sorted); free(entries); free(filters); free(data);
+    free(sorted);
+    free(entries);
+    free(filters);
+    free(data);
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) die("usage: zip-central-directory tail|eocd|list ...");
+    if (argc < 2) die("usage: zip-central-directory tail|eocd|zip64-eocd|list ...");
     if (!strcmp(argv[1], "tail")) command_tail(argc, argv);
     else if (!strcmp(argv[1], "eocd")) command_eocd(argc, argv);
+    else if (!strcmp(argv[1], "zip64-eocd")) command_zip64_eocd(argc, argv);
     else if (!strcmp(argv[1], "list")) command_list(argc, argv);
     else die("unknown zip-central-directory action");
     return 0;

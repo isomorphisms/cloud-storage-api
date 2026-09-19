@@ -78,9 +78,18 @@ Whenever giving the human a script or command block, assume `$PWD` is arbitrary.
   large-archive ranged path.
 - Grease owns provider identity, authentication, metadata, and HTTP Range
   orchestration. The small C ZIP helper owns binary structure parsing and
-  64-bit archive-offset arithmetic only; it must not grow provider/network I/O.
-- Inventory must not download the complete archive. Bound the tail read to the
-  classic EOCD maximum, then fetch exactly the central-directory range.
+  fixed-width ZIP/ZIP64 archive-offset arithmetic only; it must not grow
+  provider/network I/O.
+- Inventory must not download the complete archive. Read at most 65,577 tail
+  bytes; for ZIP64 fetch exactly the 56-byte fixed ZIP64 EOCD named by the
+  locator; then fetch exactly the validated central-directory range.
+- Ordinary single-disk ZIP64 is supported. Resolve extra field `0x0001` in
+  format order and only for classic fields carrying ZIP64 sentinel values.
+  Reject multi-disk ZIP64, malformed/duplicate ZIP64 extended information, and
+  ZIP64 central-directory features requiring a version newer than 4.5.
+- Keep the inventory memory/network boundary explicit: central directory at most
+  64 MiB and at most 1,000,000 entries unless a later change deliberately
+  revises those limits with tests.
 - Require HTTP 206 and an exact `Content-Range` for every Drive range read.
   Keep a hard maximum response size so an ignored Range header cannot become a
   silent whole-file download. The current curl implementation requires 8.4 or
@@ -89,15 +98,14 @@ Whenever giving the human a script or command block, assume `$PWD` is arbitrary.
 - Do not do multi-gigabyte ZIP offset arithmetic in shell expressions; keep it
   in the fixed-width C boundary so ARMv7 does not become a hidden exception.
 - Validate the complete central directory before writing a successful inventory
-  to stdout. Reject unsafe paths, duplicate ambiguous names, encryption,
-  unsupported compression, multi-disk archives, and ZIP64 until those cases
-  have explicit implementations and tests.
+  to stdout. Reject unsafe paths, duplicate ambiguous names, encryption, and
+  unsupported compression.
 - Keep issue #7 acceptance stages independent: (1) deterministic local range
-  fixture, (2) fake Drive ranged transport under Grease, (3) live authenticated
-  ranged inventory, (4) live bounded-member extraction, (5) live multi-member
-  retry/resume, (6) 7.75 GB Takeout inventory without full client download, and
-  (7) selected Takeout extraction. Never promote local/fake evidence into a
-  later live stage.
+  fixture, including sparse ZIP64, (2) fake Drive ranged transport under Grease,
+  (3) live authenticated ranged inventory, (4) live bounded-member extraction,
+  (5) live multi-member retry/resume, (6) 7.75 GB Takeout inventory without full
+  client download, and (7) selected Takeout extraction. Never promote
+  local/fake evidence into a later live stage.
 
 ## Synchronization
 
