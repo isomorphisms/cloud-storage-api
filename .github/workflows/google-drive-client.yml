@@ -1,0 +1,112 @@
+name: Google Drive authenticated client contracts
+
+on:
+  pull_request:
+    paths:
+      - AGENTS.md
+      - README.md
+      - commands/google-drive-api.grease
+      - commands/google-drive-auth.grease
+      - commands/google-drive-download.grease
+      - commands/google-drive-download-state.c
+      - commands/google-oauth-loopback.c
+      - docs/google-drive-auth-download.md
+      - tests/google-drive-auth.sh
+      - tests/google-drive-download.sh
+      - .github/workflows/google-drive-client.yml
+  push:
+    branches: [main]
+    paths:
+      - AGENTS.md
+      - README.md
+      - commands/google-drive-api.grease
+      - commands/google-drive-auth.grease
+      - commands/google-drive-download.grease
+      - commands/google-drive-download-state.c
+      - commands/google-oauth-loopback.c
+      - docs/google-drive-auth-download.md
+      - tests/google-drive-auth.sh
+      - tests/google-drive-download.sh
+      - .github/workflows/google-drive-client.yml
+
+concurrency:
+  group: google-drive-client-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GREASE_SOURCE_REVISION: 8052868773077602266d80bf39aad6998e2da749
+
+jobs:
+  oauth-and-restartable-download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: python:2.7.18-buster@sha256:c934af72b8bd03b9804d5bde2569c320926e70392d708d113a2e71bcf98c8a20
+    steps:
+      - name: Check out cloud storage commands
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Check out exact Grease source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: isomorphisms/oils
+          ref: ${{ env.GREASE_SOURCE_REVISION }}
+          path: grease-source
+          persist-credentials: false
+
+      - name: Build fixed-width helpers and exact Grease runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C grease-source rev-parse HEAD)" = "$GREASE_SOURCE_REVISION"
+          mkdir -p _/test-bin
+          cc -std=c99 -Wall -Wextra -Werror -O2 \
+            commands/google-oauth-loopback.c \
+            -o _/test-bin/google-oauth-loopback
+          cc -std=c99 -Wall -Wextra -Werror -O2 \
+            commands/google-drive-download-state.c \
+            -o _/test-bin/google-drive-download-state
+          (cd grease-source && build/py.sh minimal)
+          grease-source/bin/osh -c 'echo grease-runtime-ready'
+
+      - name: Install pinned jq for client contracts
+        shell: bash
+        env:
+          JQ_URL: https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-linux-amd64
+          JQ_SHA256: 020468de7539ce70ef1bceaf7cde2e8c4f2ca6c3afb84642aabc5c97d9fc2a0d
+        run: |
+          set -euo pipefail
+          python2 - <<'PY'
+          import hashlib
+          import os
+          import urllib2
+
+          data = urllib2.urlopen(os.environ['JQ_URL']).read()
+          actual = hashlib.sha256(data).hexdigest()
+          if actual != os.environ['JQ_SHA256']:
+              raise SystemExit('jq SHA-256 mismatch: %s' % actual)
+          with open('_/test-bin/jq', 'wb') as output:
+              output.write(data)
+          PY
+          chmod +x _/test-bin/jq
+          test "$(_/test-bin/jq --version)" = jq-1.8.1
+
+      - name: Exercise OAuth and restartable download state machines
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/_/test-bin:$PATH"
+          export GREASE="$PWD/grease-source/bin/osh"
+          export GOOGLE_OAUTH_LOOPBACK="$PWD/_/test-bin/google-oauth-loopback"
+          export GOOGLE_DRIVE_DOWNLOAD_STATE="$PWD/_/test-bin/google-drive-download-state"
+          sh tests/google-drive-auth.sh
+          sh tests/google-drive-download.sh
+
+      - name: State evidence boundary
+        shell: sh
+        run: |
+          printf '%s\n' \
+            'PASS: exact pinned Grease with fake OAuth/Drive transports and deterministic local durability/range corruption cases; not live Google authorization, authenticated Drive, Takeout, or physical Android evidence.'

@@ -5,6 +5,7 @@ on:
     paths:
       - AGENTS.md
       - README.md
+      - commands/google-drive-auth.grease
       - commands/google-drive-zip-inventory.grease
       - commands/zip-central-directory.c
       - tests/zip-central-directory.sh
@@ -15,6 +16,7 @@ on:
     paths:
       - AGENTS.md
       - README.md
+      - commands/google-drive-auth.grease
       - commands/google-drive-zip-inventory.grease
       - commands/zip-central-directory.c
       - tests/zip-central-directory.sh

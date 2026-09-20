@@ -1,0 +1,649 @@
+#!/usr/bin/env grease
+set -eu
+LC_ALL=C
+export LC_ALL
+
+script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+if [ -n "${GOOGLE_OAUTH_LOOPBACK:-}" ]; then
+    loopback_helper=$GOOGLE_OAUTH_LOOPBACK
+elif [ -x "$script_directory/google-oauth-loopback" ]; then
+    loopback_helper=$script_directory/google-oauth-loopback
+else
+    loopback_helper=google-oauth-loopback
+fi
+readonly_scope=https://www.googleapis.com/auth/drive.readonly
+authorization_endpoint=https://accounts.google.com/o/oauth2/v2/auth
+token_endpoint=https://oauth2.googleapis.com/token
+
+if [ "${GOOGLE_OAUTH_TEST_ENDPOINTS:-0}" = 1 ]; then
+    authorization_endpoint=${GOOGLE_OAUTH_AUTHORIZATION_ENDPOINT:-$authorization_endpoint}
+    token_endpoint=${GOOGLE_OAUTH_TOKEN_ENDPOINT:-$token_endpoint}
+elif [ -n "${GOOGLE_OAUTH_AUTHORIZATION_ENDPOINT:-}${GOOGLE_OAUTH_TOKEN_ENDPOINT:-}" ]; then
+    printf '%s\n' 'OAuth endpoint overrides require GOOGLE_OAUTH_TEST_ENDPOINTS=1' >&2
+    exit 2
+fi
+
+usage() {
+    cat <<'USAGE'
+usage:
+  google-drive-auth init CLIENT_JSON CREDENTIAL_FILE [--create-parent]
+  google-drive-auth authorize CREDENTIAL_FILE [--no-open] [--timeout SECONDS]
+  google-drive-auth begin CREDENTIAL_FILE REDIRECT_URI
+  google-drive-auth complete CREDENTIAL_FILE < CALLBACK_URL
+  google-drive-auth curl-config CREDENTIAL_FILE OUTPUT [--force-refresh]
+  google-drive-auth status CREDENTIAL_FILE
+  google-drive-auth cancel CREDENTIAL_FILE
+
+Create and maintain a private installed-application OAuth credential for
+read-only Google Drive access. Durable state is an ordinary mode-0600 file,
+not a checked-in configuration or a repeatedly copied access token.
+
+init imports the "installed" client from Google's downloaded client JSON into
+the private plain-text credential file. authorize uses PKCE, a random state
+value, the system browser, and a random IPv4 loopback port. It requests the
+least privilege that can discover and read an existing Takeout object:
+
+  https://www.googleapis.com/auth/drive.readonly
+
+For a remote/headless shell, begin writes a pending request and prints an
+authorization URL for an explicit loopback REDIRECT_URI. After the browser
+redirects, put the complete callback URL in a private file and run complete
+with that file on stdin. The authorization code never needs to be an argument.
+
+curl-config writes a private curl configuration containing a current bearer
+token. It refreshes automatically before expiry and never prints a token.
+
+Environment:
+  GOOGLE_OAUTH_LOOPBACK
+      Explicit path to the compiled google-oauth-loopback helper.
+USAGE
+}
+
+fail() {
+    printf '%s\n' "$*" >&2
+    exit 2
+}
+
+runtime_fail() {
+    printf '%s\n' "$*" >&2
+    exit 1
+}
+
+need_command() {
+    command -v "$1" >/dev/null 2>&1 || {
+        printf 'google-drive-auth needs %s\n' "$1" >&2
+        exit 127
+    }
+}
+
+validate_private_file() {
+    private_file=$1
+    description=$2
+    [ -f "$private_file" ] || fail "$description not found: $private_file"
+    [ ! -L "$private_file" ] || fail "$description must not be a symbolic link: $private_file"
+    mode=$(stat -c %a -- "$private_file") || fail "cannot inspect $description permissions"
+    case $mode in
+        *00) ;;
+        *) fail "$description must not be accessible by group or other users: $private_file" ;;
+    esac
+}
+
+read_field() {
+    field_name=$1
+    field_file=$2
+    field_count=$( { grep -c "^$field_name=" "$field_file" || :; } )
+    [ "$field_count" -le 1 ] || fail "credential file repeats $field_name"
+    sed -n "s/^$field_name=//p" "$field_file"
+}
+
+require_field() {
+    required_value=$(read_field "$1" "$2")
+    [ -n "$required_value" ] || fail "credential file has no $1"
+    printf '%s' "$required_value"
+}
+
+validate_opaque_value() {
+    opaque_name=$1
+    opaque_value=$2
+    case $opaque_value in
+        ''|*[!A-Za-z0-9._~+/:=-]*) fail "$opaque_name contains unsupported bytes" ;;
+    esac
+}
+
+validate_number() {
+    number_name=$1
+    number_value=$2
+    case $number_value in
+        ''|*[!0-9]*) fail "$number_name is not an unsigned decimal integer" ;;
+    esac
+}
+
+encode_url_component() {
+    remaining=$1
+    encoded=
+    while [ -n "$remaining" ]; do
+        first_byte=${remaining%"${remaining#?}"}
+        remaining=${remaining#?}
+        case $first_byte in
+            [A-Za-z0-9.~_-]) encoded=$encoded$first_byte ;;
+            *)
+                hexadecimal=$(printf '%02X' "'$first_byte")
+                encoded=$encoded%$hexadecimal
+                ;;
+        esac
+    done
+    printf '%s' "$encoded"
+}
+
+random_urlsafe() {
+    byte_count=$1
+    openssl rand -base64 "$byte_count" | tr '+/' '-_' | tr -d '=\r\n'
+}
+
+code_challenge() {
+    printf '%s' "$1" |
+        openssl dgst -sha256 -binary |
+        openssl base64 -A |
+        tr '+/' '-_' |
+        tr -d '='
+}
+
+scope_contains() {
+    scope_list=$1
+    wanted_scope=$2
+    case " $scope_list " in
+        *" $wanted_scope "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+credential_values() {
+    validate_private_file "$credential_file" 'OAuth credential file'
+    client_id=$(require_field client_id "$credential_file")
+    client_secret=$(read_field client_secret "$credential_file")
+    validate_opaque_value client_id "$client_id"
+    if [ -n "$client_secret" ]; then
+        validate_opaque_value client_secret "$client_secret"
+    fi
+    stored_scope=$(read_field scope "$credential_file")
+    refresh_token=$(read_field refresh_token "$credential_file")
+    access_token=$(read_field access_token "$credential_file")
+    access_token_expires_at=$(read_field access_token_expires_at "$credential_file")
+    if [ -n "$stored_scope" ] && [ "$stored_scope" != "$readonly_scope" ]; then
+        fail 'credential file contains an unsupported OAuth scope set'
+    fi
+    if [ -n "$refresh_token" ]; then validate_opaque_value refresh_token "$refresh_token"; fi
+    if [ -n "$access_token" ]; then validate_opaque_value access_token "$access_token"; fi
+}
+
+write_credentials() {
+    credential_directory=$(dirname -- "$credential_file")
+    credential_temporary=$(mktemp "$credential_directory/.google-drive-credentials.XXXXXX")
+    umask 077
+    {
+        printf '%s\n' 'schema=google-drive-oauth-v1'
+        printf 'client_id=%s\n' "$client_id"
+        if [ -n "$client_secret" ]; then printf 'client_secret=%s\n' "$client_secret"; fi
+        if [ -n "${stored_scope:-}" ]; then printf 'scope=%s\n' "$stored_scope"; fi
+        if [ -n "${refresh_token:-}" ]; then printf 'refresh_token=%s\n' "$refresh_token"; fi
+        if [ -n "${access_token:-}" ]; then printf 'access_token=%s\n' "$access_token"; fi
+        if [ -n "${access_token_expires_at:-}" ]; then
+            printf 'access_token_expires_at=%s\n' "$access_token_expires_at"
+        fi
+    } > "$credential_temporary"
+    chmod 600 "$credential_temporary"
+    mv -f -- "$credential_temporary" "$credential_file"
+}
+
+pending_path() {
+    printf '%s.pending' "$1"
+}
+
+write_pending() {
+    redirect_uri=$1
+    pending_file=$(pending_path "$credential_file")
+    [ ! -e "$pending_file" ] && [ ! -L "$pending_file" ] ||
+        fail "authorization is already pending; complete it or run google-drive-auth cancel $credential_file"
+    umask 077
+    state=$(random_urlsafe 32)
+    verifier=$(random_urlsafe 64)
+    [ "${#verifier}" -ge 43 ] || fail 'generated PKCE verifier is unexpectedly short'
+    challenge=$(code_challenge "$verifier")
+    created_at=$(date +%s)
+    {
+        printf '%s\n' 'schema=google-drive-oauth-pending-v1'
+        printf 'state=%s\n' "$state"
+        printf 'code_verifier=%s\n' "$verifier"
+        printf 'code_challenge=%s\n' "$challenge"
+        printf 'scope=%s\n' "$readonly_scope"
+        printf 'redirect_uri=%s\n' "$redirect_uri"
+        printf 'created_at=%s\n' "$created_at"
+    } > "$pending_file"
+    chmod 600 "$pending_file"
+}
+
+rewrite_pending_redirect() {
+    redirect_uri=$1
+    pending_file=$(pending_path "$credential_file")
+    temporary_pending=$pending_file.tmp.$$
+    umask 077
+    sed "/^redirect_uri=/d" "$pending_file" > "$temporary_pending"
+    printf 'redirect_uri=%s\n' "$redirect_uri" >> "$temporary_pending"
+    chmod 600 "$temporary_pending"
+    mv -f -- "$temporary_pending" "$pending_file"
+}
+
+authorization_url() {
+    pending_file=$(pending_path "$credential_file")
+    state=$(require_field state "$pending_file")
+    challenge=$(require_field code_challenge "$pending_file")
+    requested_scope=$(require_field scope "$pending_file")
+    redirect_uri=$(require_field redirect_uri "$pending_file")
+    [ -n "$redirect_uri" ] || fail 'pending OAuth request has no redirect URI'
+
+    printf '%s?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&access_type=offline&prompt=consent&code_challenge=%s&code_challenge_method=S256&state=%s\n' \
+        "$authorization_endpoint" \
+        "$(encode_url_component "$client_id")" \
+        "$(encode_url_component "$redirect_uri")" \
+        "$(encode_url_component "$requested_scope")" \
+        "$(encode_url_component "$challenge")" \
+        "$(encode_url_component "$state")"
+}
+
+write_form_pair() {
+    form_name=$1
+    form_value=$2
+    form_separator=$3
+    printf '%s%s=%s' "$form_separator" \
+        "$(encode_url_component "$form_name")" \
+        "$(encode_url_component "$form_value")" >> "$form_file"
+}
+
+token_error() {
+    error_file=$1
+    error_code=$(jq -r '.error // "unknown_error" | if type == "string" then . else "unknown_error" end' "$error_file" 2>/dev/null || printf '%s' unknown_error)
+    case $error_code in *[!A-Za-z0-9._-]*) error_code=unknown_error ;; esac
+    rm -rf -- "$(dirname -- "$error_file")"
+    case $error_code in
+        invalid_grant)
+            runtime_fail 'Google rejected the authorization grant or refresh token; run authorize again'
+            ;;
+        invalid_client)
+            runtime_fail 'Google rejected the OAuth client credentials'
+            ;;
+        invalid_scope)
+            runtime_fail 'Google rejected the requested Drive read-only scope'
+            ;;
+        *)
+            runtime_fail "Google OAuth token request failed: $error_code"
+            ;;
+    esac
+}
+
+token_post() {
+    form_file=$1
+    response_file=$2
+    token_curl_status=0
+    http_code=$(curl \
+        --fail-with-body \
+        --silent \
+        --show-error \
+        --header 'Content-Type: application/x-www-form-urlencoded' \
+        --data-binary "@$form_file" \
+        --output "$response_file" \
+        --write-out '%{http_code}' \
+        "$token_endpoint" 2>"$response_file.stderr") || token_curl_status=$?
+    token_curl_status=${token_curl_status:-0}
+    if [ "$token_curl_status" -ne 0 ]; then
+        case $http_code in
+            ''|000)
+                rm -rf -- "$(dirname -- "$response_file")"
+                runtime_fail 'Google OAuth token endpoint could not be reached'
+                ;;
+        esac
+    fi
+    case $http_code in
+        200) ;;
+        *) token_error "$response_file" ;;
+    esac
+    rm -f -- "$response_file.stderr"
+}
+
+parse_token_response() {
+    response_file=$1
+    token_response_directory=$(dirname -- "$response_file")
+    new_access_token=$(jq -er '.access_token | strings | select(length > 0)' "$response_file") || {
+        rm -rf -- "$token_response_directory"
+        runtime_fail 'Google OAuth response has no access token'
+    }
+    validate_opaque_value access_token "$new_access_token"
+    token_type=$(jq -er '.token_type | strings | ascii_downcase' "$response_file") || {
+        rm -rf -- "$token_response_directory"
+        runtime_fail 'Google OAuth response has no token type'
+    }
+    [ "$token_type" = bearer ] || {
+        rm -rf -- "$token_response_directory"
+        runtime_fail 'Google OAuth response did not return a bearer token'
+    }
+    expires_in=$(jq -er '.expires_in | numbers | floor | select(. > 0 and . <= 604800)' "$response_file") || {
+        rm -rf -- "$token_response_directory"
+        runtime_fail 'Google OAuth response has no supported positive expiry'
+    }
+    validate_number 'OAuth expires_in' "$expires_in"
+    now=$(date +%s)
+    access_token_expires_at=$((now + expires_in))
+    access_token=$new_access_token
+}
+
+exchange_result() {
+    result_file=$1
+    pending_file=$(pending_path "$credential_file")
+    validate_private_file "$pending_file" 'OAuth pending file'
+    validate_private_file "$result_file" 'OAuth callback result'
+    callback_error=$(read_field error "$result_file")
+    if [ -n "$callback_error" ]; then
+        case $callback_error in *[!A-Za-z0-9._-]*) callback_error=authorization_error ;; esac
+        rm -f -- "$result_file" "$pending_file"
+        runtime_fail "Google authorization did not complete: $callback_error"
+    fi
+    authorization_code=$(require_field code "$result_file")
+    verifier=$(require_field code_verifier "$pending_file")
+    redirect_uri=$(require_field redirect_uri "$pending_file")
+    requested_scope=$(require_field scope "$pending_file")
+    rm -f -- "$result_file"
+
+    temporary_root=${TMPDIR:-/tmp}
+    exchange_temporary=$(mktemp -d "$temporary_root/cloud-storage-oauth-exchange.XXXXXX")
+    form_file=$exchange_temporary/token.form
+    response_file=$exchange_temporary/token.response
+    umask 077
+    : > "$form_file"
+    write_form_pair code "$authorization_code" ''
+    write_form_pair client_id "$client_id" '&'
+    if [ -n "$client_secret" ]; then write_form_pair client_secret "$client_secret" '&'; fi
+    write_form_pair code_verifier "$verifier" '&'
+    write_form_pair redirect_uri "$redirect_uri" '&'
+    write_form_pair grant_type authorization_code '&'
+    token_post "$form_file" "$response_file"
+    parse_token_response "$response_file"
+    refresh_token=$(jq -er '.refresh_token | strings | select(length > 0)' "$response_file") || {
+        rm -rf -- "$exchange_temporary"
+        runtime_fail 'Google returned no refresh token; revoke the old grant if necessary and authorize again'
+    }
+    validate_opaque_value refresh_token "$refresh_token"
+    returned_scope=$(jq -r '.scope // "" | if type == "string" then . else "" end' "$response_file")
+    if [ -n "$returned_scope" ] && ! scope_contains "$returned_scope" "$readonly_scope"; then
+        rm -rf -- "$exchange_temporary"
+        runtime_fail 'Google did not grant the required Drive read-only scope'
+    fi
+    stored_scope=$requested_scope
+    write_credentials
+    rm -rf -- "$exchange_temporary"
+    rm -f -- "$result_file" "$pending_file"
+    printf 'authorized_scope=%s\n' "$stored_scope"
+    printf 'credential_file=%s\n' "$credential_file"
+}
+
+refresh_access_token() {
+    [ -n "$refresh_token" ] || runtime_fail 'authorization required; run google-drive-auth authorize first'
+    requested_scope=${stored_scope:-$readonly_scope}
+    scope_contains "$requested_scope" "$readonly_scope" ||
+        runtime_fail 'stored credential lacks the required Drive read-only scope; authorize again'
+
+    temporary_root=${TMPDIR:-/tmp}
+    refresh_temporary=$(mktemp -d "$temporary_root/cloud-storage-oauth-refresh.XXXXXX")
+    form_file=$refresh_temporary/token.form
+    response_file=$refresh_temporary/token.response
+    umask 077
+    : > "$form_file"
+    write_form_pair client_id "$client_id" ''
+    if [ -n "$client_secret" ]; then write_form_pair client_secret "$client_secret" '&'; fi
+    write_form_pair refresh_token "$refresh_token" '&'
+    write_form_pair grant_type refresh_token '&'
+    token_post "$form_file" "$response_file"
+    parse_token_response "$response_file"
+    rotated_refresh=$(jq -r '.refresh_token // "" | if type == "string" then . else "" end' "$response_file")
+    if [ -n "$rotated_refresh" ]; then
+        validate_opaque_value refresh_token "$rotated_refresh"
+        refresh_token=$rotated_refresh
+    fi
+    returned_scope=$(jq -r '.scope // "" | if type == "string" then . else "" end' "$response_file")
+    if [ -n "$returned_scope" ] && ! scope_contains "$returned_scope" "$readonly_scope"; then
+        rm -rf -- "$refresh_temporary"
+        runtime_fail 'refreshed credential lacks the required Drive read-only scope'
+    fi
+    write_credentials
+    rm -rf -- "$refresh_temporary"
+}
+
+write_curl_config() {
+    output_file=$1
+    force_refresh=$2
+    [ ! -e "$output_file" ] && [ ! -L "$output_file" ] ||
+        fail "curl configuration output already exists: $output_file"
+    now=$(date +%s)
+    usable=no
+    if [ "$force_refresh" = no ] && [ -n "$access_token" ] && [ -n "$access_token_expires_at" ]; then
+        validate_number access_token_expires_at "$access_token_expires_at"
+        if [ "$access_token_expires_at" -gt $((now + 60)) ]; then usable=yes; fi
+    fi
+    if [ "$usable" != yes ]; then refresh_access_token; fi
+    umask 077
+    printf 'header = "Authorization: Bearer %s"\n' "$access_token" > "$output_file"
+    chmod 600 "$output_file"
+}
+
+command_init() {
+    [ "$#" -ge 2 ] && [ "$#" -le 3 ] || fail 'init needs CLIENT_JSON CREDENTIAL_FILE [--create-parent]'
+    client_json=$1
+    credential_file=$2
+    create_parent=no
+    if [ "$#" -eq 3 ]; then
+        [ "$3" = --create-parent ] || fail "unknown init option: $3"
+        create_parent=yes
+    fi
+    [ -f "$client_json" ] || fail "OAuth client JSON not found: $client_json"
+    [ ! -e "$credential_file" ] && [ ! -L "$credential_file" ] ||
+        fail "credential file already exists: $credential_file"
+    credential_directory=$(dirname -- "$credential_file")
+    if [ ! -d "$credential_directory" ]; then
+        [ "$create_parent" = yes ] || fail "credential parent directory does not exist; pass --create-parent: $credential_directory"
+        mkdir -p -- "$credential_directory"
+    fi
+    client_id=$(jq -er '.installed.client_id | strings | select(length > 0)' "$client_json") ||
+        fail 'client JSON has no installed.client_id; create a Desktop app OAuth client'
+    client_secret=$(jq -r '.installed.client_secret // "" | if type == "string" then . else "" end' "$client_json")
+    validate_opaque_value client_id "$client_id"
+    if [ -n "$client_secret" ]; then validate_opaque_value client_secret "$client_secret"; fi
+    stored_scope=
+    refresh_token=
+    access_token=
+    access_token_expires_at=
+    write_credentials
+    printf 'credential_file=%s\n' "$credential_file"
+    printf '%s\n' 'authorized=no'
+}
+
+command_begin() {
+    [ "$#" -eq 2 ] || fail 'begin needs CREDENTIAL_FILE REDIRECT_URI'
+    credential_file=$1
+    manual_redirect=$2
+    case $manual_redirect in
+        http://127.0.0.1:*) ;;
+        *) fail 'REDIRECT_URI must use an explicit http://127.0.0.1:PORT loopback address' ;;
+    esac
+    manual_port=${manual_redirect#http://127.0.0.1:}
+    validate_number 'loopback port' "$manual_port"
+    [ "${#manual_port}" -le 5 ] || fail 'loopback port must be between 1 and 65535'
+    [ "$manual_port" -ge 1 ] && [ "$manual_port" -le 65535 ] ||
+        fail 'loopback port must be between 1 and 65535'
+    need_command openssl
+    credential_values
+    write_pending "$manual_redirect"
+    authorization_url
+}
+
+command_authorize() {
+    [ "$#" -ge 1 ] || fail 'authorize needs CREDENTIAL_FILE'
+    credential_file=$1
+    shift
+    no_open=no
+    callback_timeout=300
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --no-open) no_open=yes; shift ;;
+            --timeout)
+                [ "$#" -ge 2 ] || fail '--timeout needs seconds'
+                callback_timeout=$2
+                shift 2
+                ;;
+            *) fail "unknown authorize option: $1" ;;
+        esac
+    done
+    validate_number 'callback timeout' "$callback_timeout"
+    [ "$callback_timeout" -ge 1 ] && [ "$callback_timeout" -le 3600 ] ||
+        fail 'callback timeout must be between 1 and 3600 seconds'
+    credential_values
+    need_command "$loopback_helper"
+    need_command openssl
+    write_pending ''
+
+    temporary_root=${TMPDIR:-/tmp}
+    listener_temporary=$(mktemp -d "$temporary_root/cloud-storage-oauth-listener.XXXXXX")
+    port_file=$listener_temporary/port
+    result_file=$listener_temporary/result
+    "$loopback_helper" listen "$(pending_path "$credential_file")" \
+        "$port_file" "$result_file" "$callback_timeout" &
+    listener_pid=$!
+    listener_cleanup() {
+        kill "$listener_pid" >/dev/null 2>&1 || :
+        wait "$listener_pid" >/dev/null 2>&1 || :
+        rm -rf -- "$listener_temporary"
+    }
+    trap listener_cleanup EXIT HUP INT TERM
+
+    ready_attempt=0
+    while [ ! -f "$port_file" ] && [ "$ready_attempt" -lt 10 ]; do
+        if ! kill -0 "$listener_pid" >/dev/null 2>&1; then
+            wait "$listener_pid" || :
+            fail 'OAuth loopback listener failed before opening a port'
+        fi
+        sleep 1
+        ready_attempt=$((ready_attempt + 1))
+    done
+    [ -f "$port_file" ] || fail 'OAuth loopback listener did not report a port'
+    loopback_port=$(sed -n '1p' "$port_file")
+    validate_number 'loopback port' "$loopback_port"
+    [ "${#loopback_port}" -le 5 ] || fail 'OAuth loopback listener returned an invalid port'
+    [ "$loopback_port" -ge 1 ] && [ "$loopback_port" -le 65535 ] ||
+        fail 'OAuth loopback listener returned an invalid port'
+    rewrite_pending_redirect "http://127.0.0.1:$loopback_port"
+    authorize_url=$(authorization_url)
+
+    opened=no
+    if [ "$no_open" != yes ]; then
+        if command -v termux-open-url >/dev/null 2>&1; then
+            termux-open-url "$authorize_url" >/dev/null 2>&1 && opened=yes || :
+        elif command -v xdg-open >/dev/null 2>&1; then
+            xdg-open "$authorize_url" >/dev/null 2>&1 && opened=yes || :
+        fi
+    fi
+    if [ "$opened" = yes ]; then
+        printf '%s\n' 'Opened the Google authorization page in the system browser.' >&2
+    else
+        printf '%s\n' 'Open this URL in a browser on the same device:' >&2
+        printf '%s\n' "$authorize_url"
+    fi
+    printf '%s\n' 'Waiting for the private loopback callback...' >&2
+    wait "$listener_pid" || runtime_fail 'OAuth loopback authorization did not complete'
+    exchange_result "$result_file"
+    trap - EXIT HUP INT TERM
+    rm -rf -- "$listener_temporary"
+}
+
+command_complete() {
+    [ "$#" -eq 1 ] || fail 'complete needs CREDENTIAL_FILE and reads CALLBACK_URL from stdin'
+    credential_file=$1
+    credential_values
+    need_command "$loopback_helper"
+    pending_file=$(pending_path "$credential_file")
+    validate_private_file "$pending_file" 'OAuth pending file'
+    temporary_root=${TMPDIR:-/tmp}
+    complete_temporary=$(mktemp -d "$temporary_root/cloud-storage-oauth-complete.XXXXXX")
+    result_file=$complete_temporary/result
+    "$loopback_helper" parse "$pending_file" "$result_file"
+    exchange_result "$result_file"
+    rm -rf -- "$complete_temporary"
+}
+
+command_curl_config() {
+    [ "$#" -ge 2 ] && [ "$#" -le 3 ] ||
+        fail 'curl-config needs CREDENTIAL_FILE OUTPUT [--force-refresh]'
+    credential_file=$1
+    output_file=$2
+    force_refresh=no
+    if [ "$#" -eq 3 ]; then
+        [ "$3" = --force-refresh ] || fail "unknown curl-config option: $3"
+        force_refresh=yes
+    fi
+    credential_values
+    write_curl_config "$output_file" "$force_refresh"
+}
+
+command_status() {
+    [ "$#" -eq 1 ] || fail 'status needs CREDENTIAL_FILE'
+    credential_file=$1
+    credential_values
+    printf 'credential_file=%s\n' "$credential_file"
+    if [ -n "$refresh_token" ]; then printf '%s\n' 'authorized=yes'; else printf '%s\n' 'authorized=no'; fi
+    if [ -n "$stored_scope" ]; then printf 'scope=%s\n' "$stored_scope"; else printf '%s\n' 'scope='; fi
+    if [ -n "$access_token_expires_at" ]; then
+        validate_number access_token_expires_at "$access_token_expires_at"
+        now=$(date +%s)
+        if [ "$access_token_expires_at" -gt $((now + 60)) ]; then
+            printf '%s\n' 'access_token=fresh'
+        else
+            printf '%s\n' 'access_token=refresh-needed'
+        fi
+    else
+        printf '%s\n' 'access_token=missing'
+    fi
+    if [ -e "$(pending_path "$credential_file")" ]; then
+        printf '%s\n' 'authorization_pending=yes'
+    else
+        printf '%s\n' 'authorization_pending=no'
+    fi
+}
+
+command_cancel() {
+    [ "$#" -eq 1 ] || fail 'cancel needs CREDENTIAL_FILE'
+    credential_file=$1
+    pending_file=$(pending_path "$credential_file")
+    if [ -e "$pending_file" ]; then
+        validate_private_file "$pending_file" 'OAuth pending file'
+        rm -f -- "$pending_file"
+        printf '%s\n' 'authorization_pending=no'
+    else
+        printf '%s\n' 'authorization_pending=no'
+    fi
+}
+
+need_command curl
+need_command jq
+need_command stat
+
+case ${1:-} in
+    -h|--help|'') usage; exit 0 ;;
+esac
+action=$1
+shift
+case $action in
+    init) command_init "$@" ;;
+    authorize) command_authorize "$@" ;;
+    begin) command_begin "$@" ;;
+    complete) command_complete "$@" ;;
+    curl-config) command_curl_config "$@" ;;
+    status) command_status "$@" ;;
+    cancel) command_cancel "$@" ;;
+    *) fail "unknown action: $action" ;;
+esac

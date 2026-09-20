@@ -5,6 +5,7 @@ export LC_ALL
 
 script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 method_table=$script_directory/google-drive-v3-methods.tsv
+auth_command=${GOOGLE_DRIVE_AUTH:-$script_directory/google-drive-auth.grease}
 base_url=https://www.googleapis.com/drive/v3/
 upload_base_url=https://www.googleapis.com/upload/drive/v3/
 
@@ -51,6 +52,14 @@ Environment:
   GOOGLE_ACCESS_TOKEN_FILE
       Supply one OAuth 2.0 access token. The token is placed in a mode-0600 curl
       config rather than curl argv.
+
+  GOOGLE_DRIVE_CREDENTIAL_FILE
+      Private credential created by google-drive-auth. When explicit access-token
+      variables are absent, refresh a stored token automatically before expiry.
+
+  GOOGLE_DRIVE_AUTH
+      Explicit path to google-drive-auth.grease when it is not next to this
+      command.
 
   GOOGLE_DRIVE_RESOURCE_KEYS
       Optional value for X-Goog-Drive-Resource-Keys.
@@ -147,17 +156,40 @@ replace_path_value() {
     esac
 }
 
-require_token() {
+run_auth() {
+    if [ -n "${GREASE:-}" ]; then
+        "$GREASE" "$auth_command" "$@"
+    else
+        "$auth_command" "$@"
+    fi
+}
+
+write_auth_config() {
+    refresh_mode=$1
     token=${GOOGLE_ACCESS_TOKEN:-}
     if [ -z "$token" ] && [ -n "${GOOGLE_ACCESS_TOKEN_FILE:-}" ]; then
         token=$(cat -- "$GOOGLE_ACCESS_TOKEN_FILE")
     fi
-    [ -n "$token" ] || fail 'set GOOGLE_ACCESS_TOKEN or GOOGLE_ACCESS_TOKEN_FILE'
+    if [ -n "$token" ]; then
+        printf 'header = "Authorization: Bearer %s"\n' "$token" > "$curl_config"
+        return
+    fi
+
+    credential_file=${GOOGLE_DRIVE_CREDENTIAL_FILE:-}
+    [ -n "$credential_file" ] ||
+        fail 'set GOOGLE_DRIVE_CREDENTIAL_FILE, GOOGLE_ACCESS_TOKEN, or GOOGLE_ACCESS_TOKEN_FILE'
+    [ -f "$auth_command" ] || command -v "$auth_command" >/dev/null 2>&1 ||
+        fail "google-drive-auth command not found: $auth_command"
+    rm -f -- "$curl_config"
+    if [ "$refresh_mode" = force ]; then
+        run_auth curl-config "$credential_file" "$curl_config" --force-refresh
+    else
+        run_auth curl-config "$credential_file" "$curl_config"
+    fi
 }
 
 prepare_curl() {
     need_command curl
-    require_token
 
     temporary_root=${TMPDIR:-/tmp}
     mkdir -p "$temporary_root"
@@ -170,7 +202,16 @@ prepare_curl() {
     trap cleanup EXIT HUP INT TERM
 
     umask 077
-    printf 'header = "Authorization: Bearer %s"\n' "$token" > "$curl_config"
+    write_auth_config normal
+    if [ -n "${GOOGLE_DRIVE_RESOURCE_KEYS:-}" ]; then
+        printf 'header = "X-Goog-Drive-Resource-Keys: %s"\n' \
+            "$GOOGLE_DRIVE_RESOURCE_KEYS" >> "$curl_config"
+    fi
+}
+
+refresh_curl_config() {
+    [ -n "${GOOGLE_DRIVE_CREDENTIAL_FILE:-}" ] || return 1
+    write_auth_config force
     if [ -n "${GOOGLE_DRIVE_RESOURCE_KEYS:-}" ]; then
         printf 'header = "X-Goog-Drive-Resource-Keys: %s"\n' \
             "$GOOGLE_DRIVE_RESOURCE_KEYS" >> "$curl_config"
@@ -224,12 +265,14 @@ request_regular() {
     fi
 
     request_url=$base_url$api_path$query_string
+    response_headers=$temporary/response.headers
+    response_error=$temporary/response.stderr
     set -- \
-        --config "$curl_config" \
         --fail \
         --silent \
         --show-error \
-        --request "$http_method"
+        --request "$http_method" \
+        --dump-header "$response_headers"
 
     if [ -n "$body_file" ]; then
         set -- "$@" \
@@ -237,7 +280,27 @@ request_regular() {
             --data-binary "@$body_file"
     fi
 
-    curl "$@" "$request_url"
+    if curl --config "$curl_config" "$@" "$request_url" 2>"$response_error"; then
+        return
+    fi
+
+    response_status=$(awk '/^HTTP\/[0-9.]+ [0-9][0-9][0-9]/{status=$2} END{print status}' "$response_headers")
+    if [ "$response_status" = 401 ] && refresh_curl_config; then
+        : > "$response_headers"
+        : > "$response_error"
+        if curl --config "$curl_config" "$@" "$request_url" 2>"$response_error"; then
+            return
+        fi
+        response_status=$(awk '/^HTTP\/[0-9.]+ [0-9][0-9][0-9]/{status=$2} END{print status}' "$response_headers")
+    fi
+
+    case $response_status in
+        401) printf '%s\n' 'Google Drive rejected the access token after refresh; authorize again' >&2 ;;
+        403) printf '%s\n' 'Google Drive rejected the request with HTTP 403; OAuth scope or file permissions may be insufficient' >&2 ;;
+        '') cat "$response_error" >&2 ;;
+        *) printf 'Google Drive request failed with HTTP %s\n' "$response_status" >&2 ;;
+    esac
+    return 1
 }
 
 write_session_record() {
