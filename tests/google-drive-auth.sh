@@ -150,12 +150,15 @@ for secret in REFRESH_LONG_LIVED ACCESS_REFRESHED; do
     fi
 done
 
-if FAKE_REFRESH_ERROR=invalid_grant common_env curl-config "$credential" "$temporary/revoked.curl" --force-refresh \
+FAKE_REFRESH_ERROR=invalid_grant
+export FAKE_REFRESH_ERROR
+if common_env curl-config "$credential" "$temporary/revoked.curl" --force-refresh \
     >/dev/null 2>"$temporary/revoked.err"
 then
     printf '%s\n' 'revoked refresh token unexpectedly succeeded' >&2
     exit 1
 fi
+unset FAKE_REFRESH_ERROR
 grep -F 'run authorize again' "$temporary/revoked.err" >/dev/null
 
 wrong_credential=$temporary/config/wrong-scope.credentials
@@ -163,12 +166,15 @@ common_env init "$client_json" "$wrong_credential" >/dev/null
 common_env begin "$wrong_credential" http://127.0.0.1:53683 >/dev/null
 wrong_state=$(sed -n 's/^state=//p' "$wrong_credential.pending")
 printf 'http://127.0.0.1:53683/?code=WRONG_SCOPE_CODE&state=%s\n' "$wrong_state" > "$temporary/wrong.callback"
-if FAKE_SCOPE_FAILURE=1 common_env complete "$wrong_credential" \
+FAKE_SCOPE_FAILURE=1
+export FAKE_SCOPE_FAILURE
+if common_env complete "$wrong_credential" \
     < "$temporary/wrong.callback" >/dev/null 2>"$temporary/scope.err"
 then
     printf '%s\n' 'insufficient OAuth scope unexpectedly succeeded' >&2
     exit 1
 fi
+unset FAKE_SCOPE_FAILURE
 grep -F 'did not grant the required Drive read-only scope' "$temporary/scope.err" >/dev/null
 
 loop_pending=$temporary/loop.pending
