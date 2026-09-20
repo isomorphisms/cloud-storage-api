@@ -34,11 +34,11 @@ the application did not create or open. The read-only Drive scope is therefore
 the least privilege that satisfies this workflow. It does not authorize the
 write methods exposed by the separate thin API command.
 
-## Build or install the two small native helpers
+## Build or install the small native helpers
 
-The product commands are Grease. Two small C helpers own boundaries that should
-not be improvised in shell: the loopback callback socket and fixed-width file
-offset/fsync operations.
+The product commands are Grease. Small C helpers own boundaries that should not
+be improvised in shell: the loopback callback socket, fixed-width file
+offset/fsync operations, and the already-established bounded ZIP parser.
 
 From a checkout, with an explicit installation directory:
 
@@ -53,6 +53,9 @@ cc -std=c99 -Wall -Wextra -Werror -O2 \
 cc -std=c99 -Wall -Wextra -Werror -O2 \
   "$repo/commands/google-drive-download-state.c" \
   -o "$program_directory/google-drive-download-state"
+cc -std=c99 -Wall -Wextra -Werror -O2 \
+  "$repo/commands/zip-central-directory.c" \
+  -o "$program_directory/zip-central-directory"
 install -m 755 \
   "$repo/commands/google-drive-auth.grease" \
   "$repo/commands/google-drive-api.grease" \
