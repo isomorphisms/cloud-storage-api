@@ -81,6 +81,7 @@ common_env() {
     GOOGLE_OAUTH_AUTHORIZATION_ENDPOINT=https://accounts.example.test/auth \
     GOOGLE_OAUTH_TOKEN_ENDPOINT=https://oauth.example.test/token \
     GOOGLE_OAUTH_LOOPBACK=$GOOGLE_OAUTH_LOOPBACK \
+    TMPDIR=$temporary \
         "$GREASE" "$client" "$@"
 }
 
@@ -103,6 +104,23 @@ pending=$credential.pending
 [ "$(stat -c %a "$pending")" = 600 ]
 state=$(sed -n 's/^state=//p' "$pending")
 [ -n "$state" ]
+
+wrong_state_callback=$temporary/wrong-state.callback
+printf '%s\n' 'http://127.0.0.1:53682/?code=SHOULD_NOT_EXCHANGE&state=WRONG_STATE' \
+    > "$wrong_state_callback"
+chmod 600 "$wrong_state_callback"
+if common_env complete "$credential" < "$wrong_state_callback" \
+    >/dev/null 2>"$temporary/wrong-state.err"
+then
+    printf '%s\n' 'mismatched OAuth state unexpectedly succeeded' >&2
+    exit 1
+fi
+grep -F 'state did not match' "$temporary/wrong-state.err" >/dev/null
+[ -f "$pending" ]
+if find "$temporary" -maxdepth 1 -type d -name 'cloud-storage-oauth-complete.*' | grep . >/dev/null; then
+    printf '%s\n' 'failed OAuth callback left a temporary directory' >&2
+    exit 1
+fi
 
 callback=$temporary/callback.url
 printf 'http://127.0.0.1:53682/?code=AUTHORIZATION_CODE&state=%s\n' "$state" > "$callback"

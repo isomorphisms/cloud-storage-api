@@ -571,9 +571,12 @@ command_complete() {
     temporary_root=${TMPDIR:-/tmp}
     complete_temporary=$(mktemp -d "$temporary_root/cloud-storage-oauth-complete.XXXXXX")
     result_file=$complete_temporary/result
+    complete_cleanup() { rm -rf -- "$complete_temporary"; }
+    trap complete_cleanup EXIT HUP INT TERM
     "$loopback_helper" parse "$pending_file" "$result_file"
     exchange_result "$result_file"
-    rm -rf -- "$complete_temporary"
+    trap - EXIT HUP INT TERM
+    complete_cleanup
 }
 
 command_curl_config() {
