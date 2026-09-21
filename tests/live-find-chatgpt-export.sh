@@ -125,10 +125,11 @@ while :; do
     --silent \
     --show-error \
     --get \
-    --data-urlencode "q=trashed = false" \
     --data-urlencode 'pageSize=1000' \
     --data-urlencode 'spaces=drive' \
     --data-urlencode 'corpora=user' \
+    --data-urlencode 'supportsAllDrives=true' \
+    --data-urlencode 'includeItemsFromAllDrives=true' \
     --data-urlencode 'fields=nextPageToken,files(id,size,createdTime,modifiedTime,capabilities(canDownload))' \
     --output "$response" \
     --write-out '%{http_code}'
