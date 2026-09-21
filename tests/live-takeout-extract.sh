@@ -231,8 +231,8 @@ fetch_range "$data_start" "$data_end" "$compressed_size" "$work/selected.compres
 
 phase=decompress-member
 python3 - \
-  "$work/conversations.compressed" \
-  "$work/conversations.json" \
+  "$work/selected.compressed" \
+  "$work/selected.output" \
   "$expected_method" \
   "$expected_crc" \
   "$expected_uncompressed" <<'PY'
