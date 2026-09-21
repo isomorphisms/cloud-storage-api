@@ -160,7 +160,7 @@ append_drive_candidates "trashed = false and (mimeType = 'application/zip' or na
 append_drive_candidates "trashed = false and createdTime > '2026-09-17T00:00:00'"
 
 # De-duplicate without exposing unrelated Drive filenames.
-jq -s 'unique_by(.id)[]' "$candidate_file" > "$work/zip-candidates.unique.ndjson"
+jq -cs 'unique_by(.id)[]' "$candidate_file" > "$work/zip-candidates.unique.ndjson"
 mv "$work/zip-candidates.unique.ndjson" "$candidate_file"
 
 candidate_count="$(wc -l < "$candidate_file" | tr -d '[:space:]')"
