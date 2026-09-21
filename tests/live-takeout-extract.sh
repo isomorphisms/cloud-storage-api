@@ -118,48 +118,63 @@ jq -c '
 core_count="$(wc -l < "$work/core.ndjson" | tr -d '[:space:]')"
 printf 'core_member_matches=%s\n' "$core_count"
 
-if test "$core_count" -eq 0; then
-  phase=finish-google-takeout-inventory
-  nested_zip_count="$(
-    jq -s '[.[] | select(.path | test("\\.zip$"; "i"))] | length' "$work/members.ndjson"
-  )"
-  drive_member_count="$(
-    jq -s '[.[] | select(.path | startswith("Takeout/Drive/"))] | length' "$work/members.ndjson"
-  )"
-
-  printf 'archive_zip64=%s\n' "$([ "$kind" = zip64 ] && echo true || echo false)"
-  printf 'archive_member_count=%s\n' "$member_count"
-  printf 'central_directory_size=%s\n' "$central_size"
-  printf 'nested_zip_member_count=%s\n' "$nested_zip_count"
-  printf 'takeout_drive_member_count=%s\n' "$drive_member_count"
-  printf '%s\n' 'PASS stage 6: live 7.75 GB Google Takeout central directory validated with bounded Drive ranges; the archive contains no direct standard ChatGPT export members.'
-  exit 0
-fi
+nested_zip_count="$(
+  jq -s '[.[] | select(.path | test("\\.zip$"; "i"))] | length' "$work/members.ndjson"
+)"
+drive_member_count="$(
+  jq -s '[.[] | select(.path | startswith("Takeout/Drive/"))] | length' "$work/members.ndjson"
+)"
 
 printf 'archive_zip64=%s\n' "$([ "$kind" = zip64 ] && echo true || echo false)"
 printf 'archive_member_count=%s\n' "$member_count"
 printf 'central_directory_size=%s\n' "$central_size"
-printf 'selected_core_member_count=%s\n' "$core_count"
-jq -c \
-  '{path,compressed_size,uncompressed_size,compression_method,crc32,general_purpose_flags,local_header_offset}' \
-  "$work/core.ndjson"
+printf 'nested_zip_member_count=%s\n' "$nested_zip_count"
+printf 'takeout_drive_member_count=%s\n' "$drive_member_count"
 
-phase=select-conversations
-conversations_count="$(
-  jq -s \
-    '[.[] | select(.path == "conversations.json" or (.path | endswith("/conversations.json")))] | length' \
+if test "$core_count" -eq 0; then
+  printf '%s\n' 'PASS stage 6: live 7.75 GB Google Takeout central directory validated with bounded Drive ranges; the archive contains no direct standard ChatGPT export members.'
+
+  phase=select-bounded-takeout-member
+  jq -s -c '
+    [
+      .[]
+      | select((.path | endswith("/")) | not)
+      | select(.compressed_size > 0 and .compressed_size <= 16777216)
+      | select(.uncompressed_size > 0 and .uncompressed_size <= 67108864)
+      | select(.compression_method == 0 or .compression_method == 8)
+    ]
+    | sort_by(.compressed_size)
+    | .[0] // empty
+  ' "$work/members.ndjson" > "$work/selected-member.json"
+
+  test -s "$work/selected-member.json"
+  member="$work/selected-member.json"
+  selection_kind=smallest-bounded-takeout-member
+else
+  printf 'selected_core_member_count=%s\n' "$core_count"
+  jq -c \
+    '{path,compressed_size,uncompressed_size,compression_method,crc32,general_purpose_flags,local_header_offset}' \
     "$work/core.ndjson"
-)"
-test "$conversations_count" -eq 1
 
-jq -c \
-  'select(.path == "conversations.json" or (.path | endswith("/conversations.json")))' \
-  "$work/core.ndjson" > "$work/conversations-member.json"
+  phase=select-conversations
+  conversations_count="$(
+    jq -s \
+      '[.[] | select(.path == "conversations.json" or (.path | endswith("/conversations.json")))] | length' \
+      "$work/core.ndjson"
+  )"
+  test "$conversations_count" -eq 1
 
-printf '%s\n' \
-  'PASS stage 6: live 7.75 GB Takeout central directory validated and core ChatGPT members inventoried with bounded Drive ranges only.'
+  jq -c \
+    'select(.path == "conversations.json" or (.path | endswith("/conversations.json")))' \
+    "$work/core.ndjson" > "$work/selected-member.json"
 
-member="$work/conversations-member.json"
+  printf '%s\n' \
+    'PASS stage 6: live 7.75 GB Takeout central directory validated and core ChatGPT members inventoried with bounded Drive ranges only.'
+
+  member="$work/selected-member.json"
+  selection_kind=conversations
+fi
+
 offset="$(jq -r '.local_header_offset' "$member")"
 compressed_size="$(jq -r '.compressed_size' "$member")"
 expected_uncompressed="$(jq -r '.uncompressed_size' "$member")"
@@ -212,7 +227,7 @@ test "$actual_path" = "$expected_path"
 phase=read-member-data
 data_start=$((offset + header_length))
 data_end=$((data_start + compressed_size - 1))
-fetch_range "$data_start" "$data_end" "$compressed_size" "$work/conversations.compressed"
+fetch_range "$data_start" "$data_end" "$compressed_size" "$work/selected.compressed"
 
 phase=decompress-member
 python3 - \
@@ -269,15 +284,27 @@ print(f'uncompressed_size={written}')
 print(f'crc32={actual_crc}')
 PY
 
-phase=verify-json
-jq -e 'type == "array"' "$work/conversations.json" >/dev/null
-conversation_count="$(jq 'length' "$work/conversations.json")"
-output_sha256="$(sha256sum "$work/conversations.json" | awk '{print $1}')"
+phase=verify-selected-output
+output_sha256="$(sha256sum "$work/selected.output" | awk '{print $1}')"
+path_sha256="$(printf '%s' "$expected_path" | sha256sum | awk '{print $1}')"
 
-printf 'member_path=%s\n' "$expected_path"
-printf 'conversation_count=%s\n' "$conversation_count"
-printf 'output_sha256=%s\n' "$output_sha256"
+printf 'selection_kind=%s\n' "$selection_kind"
+printf 'selected_member_path_sha256=%s\n' "$path_sha256"
+printf 'selected_member_compressed_size=%s\n' "$compressed_size"
+printf 'selected_member_uncompressed_size=%s\n' "$expected_uncompressed"
+printf 'selected_member_compression_method=%s\n' "$expected_method"
+printf 'selected_member_output_sha256=%s\n' "$output_sha256"
+
+if test "$selection_kind" = conversations; then
+  jq -e 'type == "array"' "$work/selected.output" >/dev/null
+  conversation_count="$(jq 'length' "$work/selected.output")"
+  printf 'conversation_count=%s\n' "$conversation_count"
+  printf '%s\n' \
+    'PASS stage 7: conversations.json remotely extracted by bounded member-range reads and verified by size, CRC32, JSON shape, and SHA-256.'
+else
+  printf '%s\n' \
+    'PASS stage 7: a real member of the 7.75 GB Google Takeout was selectively extracted by bounded Drive ranges and verified by size, CRC32, and SHA-256; the full archive was not downloaded.'
+fi
 printf '%s\n' \
-  'PASS stage 7: conversations.json remotely extracted by bounded member-range reads and verified by size, CRC32, JSON shape, and SHA-256.'
-printf '%s\n' \
-  'NOTE: extracted private content remained only in the ephemeral runner and was not published.'
+  'NOTE: extracted private content and its exact member path remained only on the ephemeral runner and were not published.'
+
