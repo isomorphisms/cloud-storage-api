@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Live stage-6/7 acceptance; private extracted content stays on the ephemeral runner.
 set -euo pipefail
 
 : "${DRIVE_CURL_CONFIG:?set DRIVE_CURL_CONFIG to a private curl config}"
