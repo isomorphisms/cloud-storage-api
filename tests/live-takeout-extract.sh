@@ -2,6 +2,9 @@
 # Live stage-6/7 acceptance; private extracted content stays on the ephemeral runner.
 set -euo pipefail
 
+phase=start
+trap 'status=$?; printf "FAIL: live Takeout phase=%s line=%s status=%s\n" "$phase" "$LINENO" "$status" >&2; exit "$status"' ERR
+
 : "${DRIVE_CURL_CONFIG:?set DRIVE_CURL_CONFIG to a private curl config}"
 : "${TAKEOUT_FILE_ID:?set TAKEOUT_FILE_ID}"
 : "${TAKEOUT_SIZE:?set TAKEOUT_SIZE}"
@@ -12,6 +15,7 @@ work="$temporary_root/takeout-live-extract"
 rm -rf "$work"
 mkdir -p "$work"
 
+phase=build-parser
 cc -std=c99 -Wall -Wextra -Werror -O2 \
   commands/zip-central-directory.c \
   -o "$zip_helper"
@@ -46,12 +50,14 @@ fetch_range() {
 
 tab="$(printf '\t')"
 
+phase=read-tail
 tail_spec="$("$zip_helper" tail "$TAKEOUT_SIZE")"
 IFS="$tab" read -r tail_start tail_end tail_length <<EOF
 $tail_spec
 EOF
 fetch_range "$tail_start" "$tail_end" "$tail_length" "$work/tail.bin"
 
+phase=parse-end-record
 eocd="$("$zip_helper" eocd "$TAKEOUT_SIZE" "$tail_start" "$work/tail.bin")"
 IFS="$tab" read -r kind a b c d e <<EOF
 $eocd
@@ -88,10 +94,12 @@ else
   fetch_range "$central_start" "$central_end" "$central_size" "$work/central.bin"
 fi
 
+phase=parse-central-directory
 "$zip_helper" list \
   "$central_start" "$central_size" "$member_count" "$work/central.bin" \
   > "$work/members.ndjson"
 
+phase=select-core-members
 jq -c '
   select(
     (.path == "conversations.json") or
@@ -108,6 +116,7 @@ jq -c '
 ' "$work/members.ndjson" > "$work/core.ndjson"
 
 core_count="$(wc -l < "$work/core.ndjson" | tr -d '[:space:]')"
+printf 'core_member_matches=%s\n' "$core_count"
 test "$core_count" -gt 0
 
 printf 'archive_zip64=%s\n' "$([ "$kind" = zip64 ] && echo true || echo false)"
@@ -118,6 +127,7 @@ jq -c \
   '{path,compressed_size,uncompressed_size,compression_method,crc32,general_purpose_flags,local_header_offset}' \
   "$work/core.ndjson"
 
+phase=select-conversations
 conversations_count="$(
   jq -s \
     '[.[] | select(.path == "conversations.json" or (.path | endswith("/conversations.json")))] | length' \
@@ -141,6 +151,7 @@ expected_flags="$(jq -r '.general_purpose_flags' "$member")"
 expected_crc="$(jq -r '.crc32' "$member")"
 expected_path="$(jq -r '.path' "$member")"
 
+phase=read-local-header
 fixed_end=$((offset + 29))
 fetch_range "$offset" "$fixed_end" 30 "$work/local-fixed.bin"
 
@@ -181,10 +192,12 @@ PY
 )"
 test "$actual_path" = "$expected_path"
 
+phase=read-member-data
 data_start=$((offset + header_length))
 data_end=$((data_start + compressed_size - 1))
 fetch_range "$data_start" "$data_end" "$compressed_size" "$work/conversations.compressed"
 
+phase=decompress-member
 python3 - \
   "$work/conversations.compressed" \
   "$work/conversations.json" \
@@ -239,6 +252,7 @@ print(f'uncompressed_size={written}')
 print(f'crc32={actual_crc}')
 PY
 
+phase=verify-json
 jq -e 'type == "array"' "$work/conversations.json" >/dev/null
 conversation_count="$(jq 'length' "$work/conversations.json")"
 output_sha256="$(sha256sum "$work/conversations.json" | awk '{print $1}')"
