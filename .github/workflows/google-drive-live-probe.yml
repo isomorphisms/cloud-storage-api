@@ -195,3 +195,9 @@ jobs:
         run: |
           set -euo pipefail
           bash tests/live-takeout-extract.sh
+
+      - name: Search Drive ZIPs for the ChatGPT export
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tests/live-find-chatgpt-export.sh
