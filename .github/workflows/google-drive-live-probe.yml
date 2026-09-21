@@ -25,6 +25,9 @@ jobs:
       GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
       GOOGLE_DRIVE_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_REFRESH_TOKEN }}
     steps:
+      - name: Check out live extraction code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
       - name: Validate environment contract
         shell: bash
         run: |
@@ -186,3 +189,9 @@ jobs:
           printf 'range_start=%s\nrange_end=%s\nrange_length=%s\n' "$start" "$end" "$length"
           printf 'range_sha256=%s\n' "$(sha256sum "$body" | awk '{print $1}')"
           printf '%s\n' 'PASS: real authenticated bounded Drive HTTP 206 range read; no full archive download.'
+
+      - name: Inventory Takeout and selectively extract ChatGPT data
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tests/live-takeout-extract.sh
