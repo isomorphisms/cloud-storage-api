@@ -111,46 +111,60 @@ EOF
     "$kind" "$member_count" "$central_size" > "$directory/inventory.meta"
 }
 
-phase=list-drive-zips
+phase=list-drive-candidates
 candidate_file="$work/zip-candidates.ndjson"
 : > "$candidate_file"
-page_token=
 
-while :; do
-  response="$work/list.json"
-  set -- \
-    --config "$DRIVE_CURL_CONFIG" \
-    --silent \
-    --show-error \
-    --get \
-    --data-urlencode "q=trashed = false and (mimeType = 'application/zip' or name contains '.zip')" \
-    --data-urlencode 'pageSize=1000' \
-    --data-urlencode 'spaces=drive' \
-    --data-urlencode 'corpora=user' \
-    --data-urlencode 'fields=nextPageToken,files(id,name,size,mimeType,modifiedTime,capabilities(canDownload))' \
-    --output "$response" \
-    --write-out '%{http_code}'
-  if test -n "$page_token"; then
-    set -- "$@" --data-urlencode "pageToken=$page_token"
-  fi
+append_drive_candidates() {
+  local provider_query=$1
+  local response page_token status
+  page_token=
 
-  status="$(curl "$@" 'https://www.googleapis.com/drive/v3/files')"
-  test "$status" = 200
+  while :; do
+    response="$work/list-$RANDOM.json"
+    set -- \
+      --config "$DRIVE_CURL_CONFIG" \
+      --silent \
+      --show-error \
+      --get \
+      --data-urlencode "q=$provider_query" \
+      --data-urlencode 'pageSize=1000' \
+      --data-urlencode 'spaces=drive' \
+      --data-urlencode 'corpora=user' \
+      --data-urlencode 'fields=nextPageToken,files(id,name,size,mimeType,createdTime,modifiedTime,capabilities(canDownload))' \
+      --output "$response" \
+      --write-out '%{http_code}'
+    if test -n "$page_token"; then
+      set -- "$@" --data-urlencode "pageToken=$page_token"
+    fi
 
-  jq -c '
-    .files[]
-    | select(.capabilities.canDownload == true)
-    | select(.size != null)
-    | select((.name | test("\\.zip$"; "i")) or (.mimeType | test("zip"; "i")))
-    | {id,size,modifiedTime}
-  ' "$response" >> "$candidate_file"
+    status="$(curl "$@" 'https://www.googleapis.com/drive/v3/files')"
+    test "$status" = 200
 
-  page_token="$(jq -r '.nextPageToken // ""' "$response")"
-  test -n "$page_token" || break
-done
+    jq -c '
+      .files[]
+      | select(.capabilities.canDownload == true)
+      | select(.size != null)
+      | {id,size,createdTime,modifiedTime}
+    ' "$response" >> "$candidate_file"
+
+    page_token="$(jq -r '.nextPageToken // ""' "$response")"
+    test -n "$page_token" || break
+  done
+}
+
+# First cover ordinary ZIP naming/MIME. Then cover anything uploaded during the
+# period when the user says the ChatGPT export was placed in Drive, even if the
+# provider stored an unhelpful name or MIME type.
+append_drive_candidates "trashed = false and (mimeType = 'application/zip' or name contains '.zip')"
+append_drive_candidates "trashed = false and createdTime > '2026-09-17T00:00:00'"
+
+# De-duplicate without exposing unrelated Drive filenames.
+jq -s 'unique_by(.id)[]' "$candidate_file" > "$work/zip-candidates.unique.ndjson"
+mv "$work/zip-candidates.unique.ndjson" "$candidate_file"
 
 candidate_count="$(wc -l < "$candidate_file" | tr -d '[:space:]')"
-printf 'drive_zip_candidate_count=%s\n' "$candidate_count"
+printf 'drive_candidate_count=%s\n' "$candidate_count"
 test "$candidate_count" -gt 0
 
 phase=scan-zip-central-directories
@@ -208,7 +222,7 @@ while IFS= read -r candidate; do
   fi
 done < "$candidate_file"
 
-printf 'drive_zip_candidates_scanned=%s\n' "$scanned"
+printf 'drive_candidates_scanned=%s\n' "$scanned"
 printf 'valid_zip_inventories=%s\n' "$valid_zip_count"
 printf 'chatgpt_export_matches=%s\n' "$match_count"
 
