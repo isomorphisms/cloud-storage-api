@@ -110,3 +110,85 @@ jobs:
         run: |
           printf '%s\n' \
             'PASS: exact pinned Grease with fake OAuth/Drive transports and deterministic local durability/range corruption cases; not live Google authorization, authenticated Drive, Takeout, or physical Android evidence.'
+
+
+  live-drive-probe:
+    name: Live Drive API probe
+    environment: google-drive-live
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      GOOGLE_OAUTH_CLIENT_ID: ${{ vars.GOOGLE_OAUTH_CLIENT_ID }}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+      GOOGLE_DRIVE_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_REFRESH_TOKEN }}
+    steps:
+      - name: Validate live credential inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$GOOGLE_OAUTH_CLIENT_ID"
+          test -n "$GOOGLE_OAUTH_CLIENT_SECRET"
+          test -n "$GOOGLE_DRIVE_REFRESH_TOKEN"
+          printf '%s\n' 'PASS: live OAuth material is present.'
+
+      - name: Refresh access token without secrets in argv
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          id_file="$RUNNER_TEMP/client-id"
+          secret_file="$RUNNER_TEMP/client-secret"
+          refresh_file="$RUNNER_TEMP/refresh-token"
+          token_config="$RUNNER_TEMP/token.curl"
+          token_response="$RUNNER_TEMP/token.json"
+
+          printf '%s' "$GOOGLE_OAUTH_CLIENT_ID" > "$id_file"
+          printf '%s' "$GOOGLE_OAUTH_CLIENT_SECRET" > "$secret_file"
+          printf '%s' "$GOOGLE_DRIVE_REFRESH_TOKEN" > "$refresh_file"
+
+          cat > "$token_config" <<EOF
+          url = "https://oauth2.googleapis.com/token"
+          request = "POST"
+          silent
+          show-error
+          fail-with-body
+          header = "Content-Type: application/x-www-form-urlencoded"
+          data-urlencode = "client_id@$id_file"
+          data-urlencode = "client_secret@$secret_file"
+          data-urlencode = "refresh_token@$refresh_file"
+          data = "grant_type=refresh_token"
+          output = "$token_response"
+          EOF
+
+          curl --config "$token_config"
+
+          jq -e '.access_token | strings | select(length > 0)' "$token_response" >/dev/null
+          access_token="$(jq -r '.access_token' "$token_response")"
+          drive_config="$RUNNER_TEMP/drive.curl"
+          printf 'header = "Authorization: Bearer %s"\n' "$access_token" > "$drive_config"
+          chmod 600 "$drive_config"
+          unset access_token
+
+          printf 'DRIVE_CURL_CONFIG=%s\n' "$drive_config" >> "$GITHUB_ENV"
+          printf '%s\n' 'PASS: access token refreshed.'
+
+      - name: Probe Drive API and print exact provider error
+        shell: bash
+        run: |
+          set -euo pipefail
+          body="$RUNNER_TEMP/drive-probe.json"
+
+          status="$(
+            curl               --config "$DRIVE_CURL_CONFIG"               --silent               --show-error               --output "$body"               --write-out '%{http_code}'               'https://www.googleapis.com/drive/v3/files?pageSize=1&fields=files(id)'
+          )"
+
+          printf 'drive_http_status=%s\n' "$status"
+
+          if test "$status" != 200; then
+            jq '{error: (.error // .)}' "$body"
+            exit 1
+          fi
+
+          jq -e '.files | arrays' "$body" >/dev/null
+          printf '%s\n' 'PASS: authenticated Drive files.list succeeded.'
