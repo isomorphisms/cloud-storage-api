@@ -195,6 +195,65 @@ fi
 unset FAKE_SCOPE_FAILURE
 grep -F 'did not grant the required Drive read-only scope' "$temporary/scope.err" >/dev/null
 
+android_client_json=$temporary/android-web-client.json
+cat > "$android_client_json" <<'EOF_ANDROID_CLIENT'
+{
+  "web": {
+    "client_id": "ANDROID_WEB_CLIENT.apps.googleusercontent.com",
+    "client_secret": "GOCSPX-ANDROID_WEB_SECRET",
+    "redirect_uris": []
+  }
+}
+EOF_ANDROID_CLIENT
+chmod 600 "$android_client_json"
+
+android_credential=$temporary/config/google-drive-android.credentials
+android_init=$(common_env init-android "$android_client_json" "$android_credential")
+printf '%s\n' "$android_init" | grep -F 'authorized=no' >/dev/null
+grep -F 'client_type=android-web' "$android_credential" >/dev/null
+grep -F 'client_id=ANDROID_WEB_CLIENT.apps.googleusercontent.com' "$android_credential" >/dev/null
+
+android_stdout=$temporary/android-authorize.stdout
+android_stderr=$temporary/android-authorize.stderr
+common_env authorize-android "$android_credential" --no-open --timeout 20 \
+    >"$android_stdout" 2>"$android_stderr" &
+android_pid=$!
+attempt=0
+while ! grep -F 'ib://google-drive-authorize?' "$android_stdout" >/dev/null 2>&1 && [ "$attempt" -lt 10 ]; do
+    if ! kill -0 "$android_pid" >/dev/null 2>&1; then
+        wait "$android_pid" || :
+        cat "$android_stderr" >&2
+        printf '%s\n' 'Android authorization handoff exited before publishing its control URI' >&2
+        exit 1
+    fi
+    sleep 1
+    attempt=$((attempt + 1))
+done
+control_uri=$(sed -n '/^ib:\/\/google-drive-authorize?/p' "$android_stdout" | head -n 1)
+[ -n "$control_uri" ]
+printf '%s\n' "$control_uri" | grep -F 'client_id=ANDROID_WEB_CLIENT.apps.googleusercontent.com' >/dev/null
+printf '%s\n' "$control_uri" | grep -F 'scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.readonly' >/dev/null
+android_state=$(printf '%s\n' "$control_uri" | sed -n 's/.*&state=\([^&]*\)&port=.*/\1/p')
+android_port=$(printf '%s\n' "$control_uri" | sed -n 's/.*&port=\([0-9][0-9]*\)$/\1/p')
+[ -n "$android_state" ] && [ -n "$android_port" ]
+/usr/bin/curl --silent --show-error \
+    "http://127.0.0.1:$android_port/?code=ANDROID_SERVER_AUTH_CODE&state=$android_state" >/dev/null
+wait "$android_pid"
+grep -F 'refresh_token=REFRESH_LONG_LIVED' "$android_credential" >/dev/null
+grep -F 'access_token=ACCESS_INITIAL' "$android_credential" >/dev/null
+grep -F 'scope=https://www.googleapis.com/auth/drive.readonly' "$android_credential" >/dev/null
+grep -F 'code=ANDROID_SERVER_AUTH_CODE' "$form_log" >/dev/null
+grep -F 'redirect_uri=&grant_type=authorization_code' "$form_log" >/dev/null
+if grep -F 'code_verifier=' "$form_log" | tail -n 1 | grep -F 'ANDROID_SERVER_AUTH_CODE' >/dev/null 2>&1; then
+    printf '%s\n' 'Android server-code exchange unexpectedly used the Desktop PKCE verifier' >&2
+    exit 1
+fi
+for secret in GOCSPX-ANDROID_WEB_SECRET ANDROID_SERVER_AUTH_CODE; do
+    if grep -F "$secret" "$curl_log" >/dev/null; then
+        printf 'Android OAuth secret leaked into curl argv: %s\n' "$secret" >&2
+        exit 1
+    fi
+done
 loop_pending=$temporary/loop.pending
 loop_port=$temporary/loop.port
 loop_result=$temporary/loop.result
