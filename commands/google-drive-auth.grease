@@ -28,6 +28,8 @@ usage() {
 usage:
   google-drive-auth init CLIENT_JSON CREDENTIAL_FILE [--create-parent]
   google-drive-auth authorize CREDENTIAL_FILE [--no-open] [--timeout SECONDS]
+  google-drive-auth init-android WEB_CLIENT_JSON CREDENTIAL_FILE [--create-parent]
+  google-drive-auth authorize-android CREDENTIAL_FILE [--no-open] [--timeout SECONDS]
   google-drive-auth begin CREDENTIAL_FILE REDIRECT_URI
   google-drive-auth complete CREDENTIAL_FILE < CALLBACK_URL
   google-drive-auth curl-config CREDENTIAL_FILE OUTPUT [--force-refresh]
@@ -38,10 +40,19 @@ Create and maintain a private installed-application OAuth credential for
 read-only Google Drive access. Durable state is an ordinary mode-0600 file,
 not a checked-in configuration or a repeatedly copied access token.
 
-init imports the "installed" client from Google's downloaded client JSON into
-the private plain-text credential file. authorize uses PKCE, a random state
-value, the system browser, and a random IPv4 loopback port. It requests the
-least privilege that can discover and read an existing Takeout object:
+init imports the "installed" Desktop client from Google's downloaded client
+JSON into the private plain-text credential file. authorize uses PKCE, a random
+state value, the system browser, and a random IPv4 loopback port.
+
+init-android imports the Web client used by Google Identity Services for
+Android server-side/offline authorization. authorize-android starts the same
+private loopback receiver, then hands a non-secret control URI directly to IB.
+IB obtains the one-time server authorization code through Google Play services
+and returns it only to the loopback receiver. No embedded WebView is used for
+the Google consent surface.
+
+Both paths request the least privilege that can discover and read an existing
+Takeout object:
 
   https://www.googleapis.com/auth/drive.readonly
 
@@ -161,6 +172,12 @@ credential_values() {
     validate_private_file "$credential_file" 'OAuth credential file'
     client_id=$(require_field client_id "$credential_file")
     client_secret=$(read_field client_secret "$credential_file")
+    client_type=$(read_field client_type "$credential_file")
+    if [ -z "$client_type" ]; then client_type=installed; fi
+    case $client_type in
+        installed|android-web) ;;
+        *) fail "credential file has unsupported client_type: $client_type" ;;
+    esac
     validate_opaque_value client_id "$client_id"
     if [ -n "$client_secret" ]; then
         validate_opaque_value client_secret "$client_secret"
@@ -182,6 +199,7 @@ write_credentials() {
     umask 077
     {
         printf '%s\n' 'schema=google-drive-oauth-v1'
+        printf 'client_type=%s\n' "$client_type"
         printf 'client_id=%s\n' "$client_id"
         if [ -n "$client_secret" ]; then printf 'client_secret=%s\n' "$client_secret"; fi
         if [ -n "${stored_scope:-}" ]; then printf 'scope=%s\n' "$stored_scope"; fi
@@ -197,6 +215,22 @@ write_credentials() {
 
 pending_path() {
     printf '%s.pending' "$1"
+}
+
+write_android_pending() {
+    pending_file=$(pending_path "$credential_file")
+    [ ! -e "$pending_file" ] && [ ! -L "$pending_file" ] ||
+        fail "authorization is already pending; complete it or run google-drive-auth cancel $credential_file"
+    umask 077
+    state=$(random_urlsafe 32)
+    created_at=$(date +%s)
+    {
+        printf '%s\n' 'schema=google-drive-android-pending-v1'
+        printf 'state=%s\n' "$state"
+        printf 'scope=%s\n' "$readonly_scope"
+        printf 'created_at=%s\n' "$created_at"
+    } > "$pending_file"
+    chmod 600 "$pending_file"
 }
 
 write_pending() {
@@ -335,6 +369,52 @@ parse_token_response() {
     access_token=$new_access_token
 }
 
+exchange_android_result() {
+    result_file=$1
+    pending_file=$(pending_path "$credential_file")
+    validate_private_file "$pending_file" 'OAuth pending file'
+    validate_private_file "$result_file" 'OAuth callback result'
+    callback_error=$(read_field error "$result_file")
+    if [ -n "$callback_error" ]; then
+        case $callback_error in *[!A-Za-z0-9._-]*) callback_error=authorization_error ;; esac
+        rm -f -- "$result_file" "$pending_file"
+        runtime_fail "Google authorization did not complete: $callback_error"
+    fi
+    authorization_code=$(require_field code "$result_file")
+    requested_scope=$(require_field scope "$pending_file")
+    rm -f -- "$result_file"
+
+    temporary_root=${TMPDIR:-/tmp}
+    exchange_temporary=$(mktemp -d "$temporary_root/cloud-storage-oauth-android-exchange.XXXXXX")
+    form_file=$exchange_temporary/token.form
+    response_file=$exchange_temporary/token.response
+    umask 077
+    : > "$form_file"
+    write_form_pair code "$authorization_code" ''
+    write_form_pair client_id "$client_id" '&'
+    if [ -n "$client_secret" ]; then write_form_pair client_secret "$client_secret" '&'; fi
+    write_form_pair redirect_uri '' '&'
+    write_form_pair grant_type authorization_code '&'
+    token_post "$form_file" "$response_file"
+    parse_token_response "$response_file"
+    refresh_token=$(jq -er '.refresh_token | strings | select(length > 0)' "$response_file") || {
+        rm -rf -- "$exchange_temporary"
+        runtime_fail 'Google returned no refresh token; authorize again with consent'
+    }
+    validate_opaque_value refresh_token "$refresh_token"
+    returned_scope=$(jq -r '.scope // "" | if type == "string" then . else "" end' "$response_file")
+    if [ -n "$returned_scope" ] && ! scope_contains "$returned_scope" "$readonly_scope"; then
+        rm -rf -- "$exchange_temporary"
+        runtime_fail 'Google did not grant the required Drive read-only scope'
+    fi
+    stored_scope=$requested_scope
+    write_credentials
+    rm -rf -- "$exchange_temporary"
+    rm -f -- "$pending_file"
+    printf 'authorized_scope=%s\n' "$stored_scope"
+    printf 'credential_file=%s\n' "$credential_file"
+}
+
 exchange_result() {
     result_file=$1
     pending_file=$(pending_path "$credential_file")
@@ -455,6 +535,41 @@ command_init() {
     client_secret=$(jq -r '.installed.client_secret // "" | if type == "string" then . else "" end' "$client_json")
     validate_opaque_value client_id "$client_id"
     if [ -n "$client_secret" ]; then validate_opaque_value client_secret "$client_secret"; fi
+    client_type=installed
+    stored_scope=
+    refresh_token=
+    access_token=
+    access_token_expires_at=
+    write_credentials
+    printf 'credential_file=%s\n' "$credential_file"
+    printf '%s\n' 'authorized=no'
+}
+
+command_init_android() {
+    [ "$#" -ge 2 ] && [ "$#" -le 3 ] ||
+        fail 'init-android needs WEB_CLIENT_JSON CREDENTIAL_FILE [--create-parent]'
+    client_json=$1
+    credential_file=$2
+    create_parent=no
+    if [ "$#" -eq 3 ]; then
+        [ "$3" = --create-parent ] || fail "unknown init-android option: $3"
+        create_parent=yes
+    fi
+    [ -f "$client_json" ] || fail "OAuth client JSON not found: $client_json"
+    [ ! -e "$credential_file" ] && [ ! -L "$credential_file" ] ||
+        fail "credential file already exists: $credential_file"
+    credential_directory=$(dirname -- "$credential_file")
+    if [ ! -d "$credential_directory" ]; then
+        [ "$create_parent" = yes ] ||
+            fail "credential parent directory does not exist; pass --create-parent: $credential_directory"
+        mkdir -p -- "$credential_directory"
+    fi
+    client_id=$(jq -er '.web.client_id | strings | select(length > 0)' "$client_json") ||
+        fail 'client JSON has no web.client_id; create a Web application OAuth client'
+    client_secret=$(jq -r '.web.client_secret // "" | if type == "string" then . else "" end' "$client_json")
+    validate_opaque_value client_id "$client_id"
+    if [ -n "$client_secret" ]; then validate_opaque_value client_secret "$client_secret"; fi
+    client_type=android-web
     stored_scope=
     refresh_token=
     access_token=
@@ -479,6 +594,8 @@ command_begin() {
         fail 'loopback port must be between 1 and 65535'
     need_command openssl
     credential_values
+    [ "$client_type" = installed ] ||
+        fail 'begin requires a Desktop installed-app credential; use authorize-android for an Android Web client'
     write_pending "$manual_redirect"
     authorization_url
 }
@@ -504,6 +621,8 @@ command_authorize() {
     [ "$callback_timeout" -ge 1 ] && [ "$callback_timeout" -le 3600 ] ||
         fail 'callback timeout must be between 1 and 3600 seconds'
     credential_values
+    [ "$client_type" = installed ] ||
+        fail 'authorize requires a Desktop installed-app credential; use authorize-android for an Android Web client'
     need_command "$loopback_helper"
     need_command openssl
     write_pending ''
@@ -561,10 +680,91 @@ command_authorize() {
     rm -rf -- "$listener_temporary"
 }
 
+command_authorize_android() {
+    [ "$#" -ge 1 ] || fail 'authorize-android needs CREDENTIAL_FILE'
+    credential_file=$1
+    shift
+    no_open=no
+    callback_timeout=300
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --no-open) no_open=yes; shift ;;
+            --timeout)
+                [ "$#" -ge 2 ] || fail '--timeout needs seconds'
+                callback_timeout=$2
+                shift 2
+                ;;
+            *) fail "unknown authorize-android option: $1" ;;
+        esac
+    done
+    validate_number 'callback timeout' "$callback_timeout"
+    [ "$callback_timeout" -ge 1 ] && [ "$callback_timeout" -le 3600 ] ||
+        fail 'callback timeout must be between 1 and 3600 seconds'
+    credential_values
+    [ "$client_type" = android-web ] ||
+        fail 'authorize-android requires a Web application OAuth client imported by init-android'
+    need_command "$loopback_helper"
+    need_command openssl
+    write_android_pending
+
+    temporary_root=${TMPDIR:-/tmp}
+    listener_temporary=$(mktemp -d "$temporary_root/cloud-storage-oauth-android-listener.XXXXXX")
+    port_file=$listener_temporary/port
+    result_file=$listener_temporary/result
+    "$loopback_helper" listen "$(pending_path "$credential_file")" \
+        "$port_file" "$result_file" "$callback_timeout" &
+    listener_pid=$!
+    listener_cleanup() {
+        kill "$listener_pid" >/dev/null 2>&1 || :
+        wait "$listener_pid" >/dev/null 2>&1 || :
+        rm -rf -- "$listener_temporary"
+    }
+    trap listener_cleanup EXIT HUP INT TERM
+
+    ready_attempt=0
+    while [ ! -f "$port_file" ] && [ "$ready_attempt" -lt 10 ]; do
+        if ! kill -0 "$listener_pid" >/dev/null 2>&1; then
+            wait "$listener_pid" || :
+            fail 'OAuth loopback listener failed before opening a port'
+        fi
+        sleep 1
+        ready_attempt=$((ready_attempt + 1))
+    done
+    [ -f "$port_file" ] || fail 'OAuth loopback listener did not report a port'
+    loopback_port=$(sed -n '1p' "$port_file")
+    validate_number 'loopback port' "$loopback_port"
+    [ "${#loopback_port}" -le 5 ] || fail 'OAuth loopback listener returned an invalid port'
+    [ "$loopback_port" -ge 1 ] && [ "$loopback_port" -le 65535 ] ||
+        fail 'OAuth loopback listener returned an invalid port'
+
+    pending_file=$(pending_path "$credential_file")
+    state=$(require_field state "$pending_file")
+    requested_scope=$(require_field scope "$pending_file")
+    control_uri="ib://google-drive-authorize?client_id=$(encode_url_component "$client_id")&scope=$(encode_url_component "$requested_scope")&state=$(encode_url_component "$state")&port=$loopback_port"
+
+    opened=no
+    if [ "$no_open" != yes ] && command -v termux-open-url >/dev/null 2>&1; then
+        termux-open-url "$control_uri" >/dev/null 2>&1 && opened=yes || :
+    fi
+    if [ "$opened" = yes ]; then
+        printf '%s\n' 'Opened the private Google Drive authorization handoff in IB.' >&2
+    else
+        printf '%s\n' 'Open this private handoff URI in IB on the same device:' >&2
+        printf '%s\n' "$control_uri"
+    fi
+    printf '%s\n' 'Waiting for the private loopback authorization code...' >&2
+    wait "$listener_pid" || runtime_fail 'Android Google authorization did not complete'
+    exchange_android_result "$result_file"
+    trap - EXIT HUP INT TERM
+    rm -rf -- "$listener_temporary"
+}
+
 command_complete() {
     [ "$#" -eq 1 ] || fail 'complete needs CREDENTIAL_FILE and reads CALLBACK_URL from stdin'
     credential_file=$1
     credential_values
+    [ "$client_type" = installed ] ||
+        fail 'complete requires a Desktop installed-app credential'
     need_command "$loopback_helper"
     pending_file=$(pending_path "$credential_file")
     validate_private_file "$pending_file" 'OAuth pending file'
@@ -643,6 +843,8 @@ shift
 case $action in
     init) command_init "$@" ;;
     authorize) command_authorize "$@" ;;
+    init-android) command_init_android "$@" ;;
+    authorize-android) command_authorize_android "$@" ;;
     begin) command_begin "$@" ;;
     complete) command_complete "$@" ;;
     curl-config) command_curl_config "$@" ;;
