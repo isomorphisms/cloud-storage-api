@@ -242,9 +242,10 @@ wait "$android_pid"
 grep -F 'refresh_token=REFRESH_LONG_LIVED' "$android_credential" >/dev/null
 grep -F 'access_token=ACCESS_INITIAL' "$android_credential" >/dev/null
 grep -F 'scope=https://www.googleapis.com/auth/drive.readonly' "$android_credential" >/dev/null
-grep -F 'code=ANDROID_SERVER_AUTH_CODE' "$form_log" >/dev/null
-grep -F 'redirect_uri=&grant_type=authorization_code' "$form_log" >/dev/null
-if grep -F 'code_verifier=' "$form_log" | tail -n 1 | grep -F 'ANDROID_SERVER_AUTH_CODE' >/dev/null 2>&1; then
+android_form=$(tail -n 1 "$form_log")
+printf '%s\n' "$android_form" | grep -F 'code=ANDROID_SERVER_AUTH_CODE' >/dev/null
+printf '%s\n' "$android_form" | grep -F 'redirect_uri=&grant_type=authorization_code' >/dev/null
+if printf '%s\n' "$android_form" | grep -F 'code_verifier=' >/dev/null; then
     printf '%s\n' 'Android server-code exchange unexpectedly used the Desktop PKCE verifier' >&2
     exit 1
 fi
