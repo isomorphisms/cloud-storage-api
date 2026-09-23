@@ -113,6 +113,13 @@ command_listen() {
     write_offer "$offer_file" loopback port "$port"
 
     wait "$listener_pid" || exit 1
+
+    state_count=$( { grep -c '^state=' "$pending_file" || :; } )
+    [ "$state_count" -eq 1 ] || fail 'OAuth pending file must contain exactly one state field'
+    state=$(sed -n 's/^state=//p' "$pending_file")
+    [ -n "$state" ] || fail 'OAuth pending file has an empty state field'
+    printf 'state=%s\n' "$state" >> "$result_file"
+
     trap - EXIT HUP INT TERM
     rm -rf -- "$working"
 }
