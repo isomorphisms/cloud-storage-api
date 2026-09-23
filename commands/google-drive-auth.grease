@@ -391,6 +391,11 @@ exchange_android_result() {
     pending_file=$(pending_path "$credential_file")
     validate_private_file "$pending_file" 'OAuth pending file'
     validate_private_file "$result_file" 'OAuth callback result'
+    expected_state=$(require_field state "$pending_file")
+    returned_state=$(require_field state "$result_file")
+    [ "$returned_state" = "$expected_state" ] ||
+        runtime_fail 'Android authorization state did not match the pending request'
+
     callback_error=$(read_field error "$result_file")
     if [ -n "$callback_error" ]; then
         case $callback_error in *[!A-Za-z0-9._-]*) callback_error=authorization_error ;; esac
