@@ -7,6 +7,7 @@ on:
       - README.md
       - commands/google-drive-api.grease
       - commands/google-drive-auth.grease
+      - commands/google-drive-authorization-handoff.grease
       - commands/google-drive-download.grease
       - commands/google-drive-download-state.c
       - commands/google-oauth-loopback.c
@@ -23,6 +24,7 @@ on:
       - README.md
       - commands/google-drive-api.grease
       - commands/google-drive-auth.grease
+      - commands/google-drive-authorization-handoff.grease
       - commands/google-drive-download.grease
       - commands/google-drive-download-state.c
       - commands/google-oauth-loopback.c
