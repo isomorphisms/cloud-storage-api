@@ -65,6 +65,12 @@ ordinary API, download, and ZIP-range requests no longer require a manually
 copied hourly access token. Explicit `GOOGLE_ACCESS_TOKEN` and
 `GOOGLE_ACCESS_TOKEN_FILE` remain lower-level fallbacks.
 
+The Android authorization path uses the same durable credential and token
+exchange but now depends on a narrow result-handoff adapter. The current adapter
+still lowers the one-time server-code return to random IPv4 loopback; that
+transport is provisional and can be replaced without changing the OAuth state
+machine.
+
 Tokens are placed in a private curl config rather than curl argv.
 `GOOGLE_DRIVE_RESOURCE_KEYS` can supply the documented
 `X-Goog-Drive-Resource-Keys` header when link-shared resources require it. See
