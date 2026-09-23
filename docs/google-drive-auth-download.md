@@ -160,6 +160,26 @@ private `ib://google-drive-authorize?...` URI. It does not interpret the value
 as a TCP port. The current loopback adapter happens to publish
 `control_name=port`; that is adapter vocabulary rather than OAuth vocabulary.
 
+The private result returned by every adapter carries the pending OAuth state
+alongside exactly one result:
+
+```text
+state=<same state from the pending authorization>
+code=<one-time server authorization code>
+```
+
+or:
+
+```text
+state=<same state from the pending authorization>
+error=<bounded provider error>
+```
+
+`google-drive-auth` validates that state itself before exchanging a code. A
+transport may validate state earlier as defense in depth, as the loopback helper
+does, but transport-specific validation is not allowed to become the only OAuth
+state check.
+
 On Termux the command sends the control URI directly to IB with
 `termux-open-url`; if that helper is unavailable, it prints the URI. The URI
 contains only the Web client ID, requested read-only scope, state, and the
