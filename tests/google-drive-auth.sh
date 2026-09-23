@@ -279,7 +279,11 @@ EOF_OFFER
 chmod 600 "$offer_file"
 {
     printf '%s\n' 'code=ADAPTER_SERVER_AUTH_CODE'
-    printf 'state=%s\n' "$state"
+    if [ "${FAKE_HANDOFF_WRONG_STATE:-0}" = 1 ]; then
+        printf '%s\n' 'state=WRONG_ADAPTER_STATE'
+    else
+        printf 'state=%s\n' "$state"
+    fi
 } > "$result_file"
 chmod 600 "$result_file"
 EOF_FAKE_HANDOFF
@@ -304,6 +308,22 @@ grep -F 'refresh_token=REFRESH_LONG_LIVED' "$adapter_credential" >/dev/null
 grep -F 'access_token=ACCESS_INITIAL' "$adapter_credential" >/dev/null
 adapter_form=$(tail -n 1 "$form_log")
 printf '%s\n' "$adapter_form" | grep -F 'code=ADAPTER_SERVER_AUTH_CODE' >/dev/null
+
+wrong_adapter_credential=$temporary/config/google-drive-android-wrong-adapter.credentials
+common_env init-android "$android_client_json" "$wrong_adapter_credential" >/dev/null
+export GOOGLE_DRIVE_AUTHORIZATION_HANDOFF=$fake_handoff
+export FAKE_HANDOFF_WRONG_STATE=1
+if common_env authorize-android "$wrong_adapter_credential" --no-open --timeout 20 \
+    >"$temporary/wrong-adapter.stdout" 2>"$temporary/wrong-adapter.stderr"
+then
+    printf '%s\n' 'wrong-state Android handoff unexpectedly succeeded' >&2
+    exit 1
+fi
+unset FAKE_HANDOFF_WRONG_STATE
+unset GOOGLE_DRIVE_AUTHORIZATION_HANDOFF
+grep -F 'Android authorization state did not match the pending request' \
+    "$temporary/wrong-adapter.stderr" >/dev/null
+[ -f "$wrong_adapter_credential.pending" ]
 
 loop_pending=$temporary/loop.pending
 loop_port=$temporary/loop.port
