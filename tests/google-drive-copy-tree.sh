@@ -84,7 +84,7 @@ if [ "$method" = GET ]; then
             marker_source=
             for candidate in SOURCE FOLDER1 FILE1 FILE2 FILE3; do
                 case $url in
-                    *"$candidate"*)
+                    *"value%3D%27$candidate%27"*)
                         marker_source=$candidate
                         break
                         ;;
