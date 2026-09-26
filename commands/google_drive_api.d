@@ -1,6 +1,6 @@
 module google_drive_api;
 
-import core.sys.posix.sys.stat : chmod;
+import core.sys.posix.sys.stat : chmod, S_IRUSR, S_IWUSR;
 import std.algorithm : startsWith;
 import std.array : appender;
 import std.conv : to;
@@ -25,7 +25,7 @@ private struct DriveMethod {
     string path;
     bool has_json_body;
     bool has_resumable_upload;
-    bool deprecated;
+    bool deprecated_;
 }
 
 private struct Pair {
@@ -287,7 +287,7 @@ private void write_session(
         temporary,
         session_json(method, api_path, media_file, media_type, media_size, session_uri).toString() ~ "\n"
     );
-    chmod(temporary.toStringz, 0o600);
+    chmod(temporary.toStringz, S_IRUSR | S_IWUSR);
     rename(temporary, path);
 }
 
