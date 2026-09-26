@@ -37,6 +37,16 @@ done
 port=$(cat "$port_file")
 base=http://127.0.0.1:$port
 
+
+assert_log() {
+    pattern=$1
+    if ! grep -F -- "$pattern" "$log_file" >/dev/null; then
+        printf 'missing request-log text: %s\n' "$pattern" >&2
+        cat "$log_file" >&2
+        exit 1
+    fi
+}
+
 run_client() {
     GOOGLE_ACCESS_TOKEN=SECRET_TOKEN_VALUE \
     GOOGLE_DRIVE_RESOURCE_KEYS='FILE123/RESOURCEKEY' \
@@ -57,8 +67,8 @@ list_output=$(run_client files.list \
     --query "q=name contains 'report'" \
     --query 'fields=nextPageToken,files(id,name)')
 [ "$list_output" = '{"files":[],"nextPageToken":"NEXT123"}' ]
-grep -F '"url":"/drive/v3/files?q=name%20contains%20%27report%27&fields=nextPageToken%2Cfiles%28id%2Cname%29"' "$log_file" >/dev/null
-grep -F '"resource_keys":"FILE123/RESOURCEKEY"' "$log_file" >/dev/null
+assert_log '"url":"/drive/v3/files?q=name%20contains%20%27report%27&fields=nextPageToken%2Cfiles%28id%2Cname%29"'
+assert_log '"resource_keys":"FILE123/RESOURCEKEY"'
 
 printf '%s\n' 'stage: JSON body request' >&2
 body=$temporary/permission.json
@@ -68,7 +78,7 @@ permission_output=$(run_client permissions.create \
     --query supportsAllDrives=true \
     --body "$body")
 [ "$permission_output" = '{"id":"PERM123"}' ]
-grep -F '"method":"POST","url":"/drive/v3/files/FILE123/permissions?supportsAllDrives=true"' "$log_file" >/dev/null
+assert_log '"method":"POST","url":"/drive/v3/files/FILE123/permissions?supportsAllDrives=true"'
 grep -F '"body":"{\"type\":\"user\",\"role\":\"reader\",\"emailAddress\":\"reader@example.test\"}\\n"' "$log_file" >/dev/null
 
 printf '%s\n' 'stage: request validation' >&2
@@ -97,8 +107,8 @@ upload_output=$(run_client files.create \
     --session-file "$session")
 [ "$upload_output" = '{"id":"UPLOADED"}' ]
 [ ! -e "$session" ] || { printf '%s\n' 'completed upload left session file behind' >&2; exit 1; }
-grep -F '"content_range":"bytes 0-9/10"' "$log_file" >/dev/null
-grep -F '"content_range":"bytes 4-9/10","body":"567890"' "$log_file" >/dev/null
+assert_log '"content_range":"bytes 0-9/10"'
+assert_log '"content_range":"bytes 4-9/10","body":"567890"'
 
 printf '%s\n' 'stage: persisted resumable recovery' >&2
 resume=$temporary/resume.session
@@ -113,7 +123,7 @@ resume_output=$(run_client files.create \
     --session-file "$resume")
 [ "$resume_output" = '{"id":"RESUMED"}' ]
 [ ! -e "$resume" ] || { printf '%s\n' 'resumed upload left session file behind' >&2; exit 1; }
-grep -F '"content_range":"bytes */10","body":""' "$log_file" >/dev/null
+assert_log '"content_range":"bytes */10","body":""'
 
 grep -F 'SECRET_TOKEN_VALUE' "$log_file" >/dev/null
 printf '%s\n' 'google-drive-api D contract passes'
