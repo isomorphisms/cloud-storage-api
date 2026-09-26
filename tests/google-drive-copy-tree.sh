@@ -101,6 +101,12 @@ case $method in
         esac
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$source" file "$version" "$parent" "$dest_id" "$name" "$mime" "$size" "$sha" >> "$FAKE_STATE"
+        # Model the ambiguous outcome: Drive created the object, but the
+        # response was lost. A retry must discover it instead of copying twice.
+        if [ "${FAKE_LOST_COPY_RESPONSE:-0}" = 1 ] && [ "$source" = FILE1 ]; then
+            printf '%s\n' 'fixture: copy completed remotely; response lost' >&2
+            exit 75
+        fi
         jq -cn --arg id "$dest_id" --arg n "$name" --arg m "$mime" --arg s "$size" --arg h "$sha" \
           '{id:$id,name:$n,mimeType:$m} + (if $s=="" then {} else {size:$s} end) + (if $h=="" then {} else {sha256Checksum:$h} end)'
         ;;
@@ -133,6 +139,29 @@ printf '%s\n' "$second" | tail -n 1 | jq -e \
 
 grep -F 'copyComments=true' "$log" >/dev/null
 grep -F 'cloud_storage_api_source_version' "$log" >/dev/null
+
+# Start a separate copy, lose a successful mutation's response, then resume.
+# This is a fake-provider receipt, not a live Drive transfer.
+: > "$state"
+: > "$log"
+FAKE_LOST_COPY_RESPONSE=1
+export FAKE_LOST_COPY_RESPONSE
+if run_copy ROOT DEST --name archive >"$temporary/interrupted.jsonl" 2>"$temporary/interrupted.err"; then
+    printf '%s\n' 'lost copy response unexpectedly reported success' >&2
+    exit 1
+fi
+unset FAKE_LOST_COPY_RESPONSE
+grep -F 'fixture: copy completed remotely; response lost' "$temporary/interrupted.err" >/dev/null
+tail -n 1 "$temporary/interrupted.jsonl" | jq -e \
+    '.complete==false and .failed==1' >/dev/null
+[ "$(wc -l < "$state" | tr -d '[:space:]')" = 4 ]
+
+resumed=$(run_copy ROOT DEST --name archive)
+printf '%s\n' "$resumed" | tail -n 1 | jq -e \
+    '.created==0 and .reused==4 and .failed==0 and .complete==true' >/dev/null
+[ "$(wc -l < "$state" | tr -d '[:space:]')" = 4 ]
+# Both files were copied exactly once across failure and retry.
+[ "$(grep -c '^drive.files.copy ' "$log")" = 2 ]
 
 readonly_credential=$temporary/readonly.credentials
 printf '%s\n' \
