@@ -60,6 +60,8 @@ jobs:
     steps:
       - name: Check out cloud storage commands
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Check out exact Grease source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -138,6 +140,7 @@ jobs:
       - name: Check out live probe source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: Validate live credential inputs
