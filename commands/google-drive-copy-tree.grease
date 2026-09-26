@@ -1,0 +1,401 @@
+#!/usr/bin/env grease
+set -eu
+LC_ALL=C
+export LC_ALL
+
+script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+api_command=$script_directory/google-drive-api.grease
+folder_mime=application/vnd.google-apps.folder
+origin_key=cloud_storage_api_source_id
+
+usage() {
+    cat <<'EOF'
+usage:
+  google-drive-copy-tree SOURCE_FOLDER [DESTINATION_PARENT]
+
+Recursively copy a Google Drive folder into another Drive folder without
+round-tripping file contents through this machine.
+
+SOURCE_FOLDER and DESTINATION_PARENT may be raw Drive IDs or ordinary Drive
+folder URLs. DESTINATION_PARENT defaults to My Drive root. The source folder
+itself is recreated under DESTINATION_PARENT.
+
+The command writes compact NDJSON receipts to stdout. Each created or reused
+object records both source and destination IDs. Copies receive a private Drive
+appProperties marker containing the source ID, so rerunning the command can
+reconcile an interrupted run instead of creating another copy.
+
+This copies the current Drive objects and file contents. It does not clone
+permissions, comments, or revision history.
+
+Requires jq plus the same authentication accepted by google-drive-api:
+  GOOGLE_ACCESS_TOKEN
+  GOOGLE_ACCESS_TOKEN_FILE
+  GOOGLE_DRIVE_RESOURCE_KEYS
+EOF
+}
+
+fail() {
+    printf '%s\n' "$*" >&2
+    exit 2
+}
+
+need_command() {
+    command -v "$1" >/dev/null 2>&1 || {
+        printf 'google-drive-copy-tree needs %s\n' "$1" >&2
+        exit 127
+    }
+}
+
+drive_id() {
+    value=$1
+    case $value in
+        *'/d/'*)
+            value=${value#*/d/}
+            value=${value%%/*}
+            ;;
+        *'/folders/'*)
+            value=${value#*/folders/}
+            value=${value%%/*}
+            ;;
+        *'id='*)
+            value=${value#*id=}
+            value=${value%%&*}
+            ;;
+    esac
+
+    value=${value%%\?*}
+    value=${value%%\#*}
+
+    [ -n "$value" ] || fail 'empty Google Drive id'
+    printf '%s\n' "$value"
+}
+
+run_api() {
+    if [ -n "${GREASE:-}" ]; then
+        "$GREASE" "$api_command" "$@"
+    else
+        "$api_command" "$@"
+    fi
+}
+
+emit_event() {
+    jq -cn \
+        --arg kind "$1" \
+        --arg status "$2" \
+        --arg source_id "$3" \
+        --arg destination_id "$4" \
+        --arg name "$5" \
+        --arg mime_type "$6" \
+        '{
+            kind: $kind,
+            status: $status,
+            source_id: $source_id,
+            destination_id: $destination_id,
+            name: $name,
+            mime_type: $mime_type
+        }'
+}
+
+find_existing() {
+    fe_source_id=$1
+    fe_parent_id=$2
+    fe_expected_mime=$3
+    fe_response=$(mktemp "$temporary/existing.XXXXXX")
+    fe_query="'$fe_parent_id' in parents and trashed=false and appProperties has { key='$origin_key' and value='$fe_source_id' }"
+
+    set -- drive.files.list \
+        --query 'pageSize=2' \
+        --query 'supportsAllDrives=true' \
+        --query 'includeItemsFromAllDrives=true' \
+        --query 'spaces=drive' \
+        --query "q=$fe_query" \
+        --query 'fields=files(id,name,mimeType,appProperties)'
+
+    if [ -n "$destination_drive_id" ]; then
+        set -- "$@" \
+            --query 'corpora=drive' \
+            --query "driveId=$destination_drive_id"
+    fi
+
+    run_api "$@" > "$fe_response"
+
+    fe_count=$(jq -r '.files | length' "$fe_response")
+    case $fe_count in
+        0)
+            rm -f -- "$fe_response"
+            return 1
+            ;;
+        1)
+            fe_actual_mime=$(jq -r '.files[0].mimeType // empty' "$fe_response")
+            [ "$fe_actual_mime" = "$fe_expected_mime" ] || {
+                rm -f -- "$fe_response"
+                fail "existing destination object for $fe_source_id has MIME type $fe_actual_mime, expected $fe_expected_mime"
+            }
+            jq -r '.files[0].id' "$fe_response"
+            rm -f -- "$fe_response"
+            return 0
+            ;;
+        *)
+            rm -f -- "$fe_response"
+            fail "multiple destination objects carry source marker $fe_source_id"
+            ;;
+    esac
+}
+
+create_folder_copy() {
+    cf_source_id=$1
+    cf_name=$2
+    cf_parent_id=$3
+
+    if cf_existing_id=$(find_existing "$cf_source_id" "$cf_parent_id" "$folder_mime"); then
+        result_id=$cf_existing_id
+        folders_reused=$((folders_reused + 1))
+        emit_event folder reused "$cf_source_id" "$result_id" "$cf_name" "$folder_mime"
+        return 0
+    fi
+
+    cf_body=$(mktemp "$temporary/folder-body.XXXXXX")
+    cf_response=$(mktemp "$temporary/folder-response.XXXXXX")
+
+    jq -n \
+        --arg name "$cf_name" \
+        --arg mime_type "$folder_mime" \
+        --arg parent_id "$cf_parent_id" \
+        --arg source_id "$cf_source_id" \
+        --arg origin_key "$origin_key" \
+        '{
+            name: $name,
+            mimeType: $mime_type,
+            parents: [$parent_id],
+            appProperties: {($origin_key): $source_id}
+        }' > "$cf_body"
+
+    run_api drive.files.create \
+        --query 'supportsAllDrives=true' \
+        --query 'fields=id,name,mimeType,parents,appProperties' \
+        --body "$cf_body" > "$cf_response"
+
+    result_id=$(jq -er '.id' "$cf_response") ||
+        fail "Drive did not return an id while creating folder $cf_name"
+
+    folders_created=$((folders_created + 1))
+    emit_event folder created "$cf_source_id" "$result_id" "$cf_name" "$folder_mime"
+    rm -f -- "$cf_body" "$cf_response"
+}
+
+copy_file_object() {
+    co_source_id=$1
+    co_name=$2
+    co_mime_type=$3
+    co_parent_id=$4
+
+    if co_existing_id=$(find_existing "$co_source_id" "$co_parent_id" "$co_mime_type"); then
+        result_id=$co_existing_id
+        files_reused=$((files_reused + 1))
+        emit_event file reused "$co_source_id" "$result_id" "$co_name" "$co_mime_type"
+        return 0
+    fi
+
+    co_body=$(mktemp "$temporary/copy-body.XXXXXX")
+    co_response=$(mktemp "$temporary/copy-response.XXXXXX")
+
+    jq -n \
+        --arg name "$co_name" \
+        --arg parent_id "$co_parent_id" \
+        --arg source_id "$co_source_id" \
+        --arg origin_key "$origin_key" \
+        '{
+            name: $name,
+            parents: [$parent_id],
+            appProperties: {($origin_key): $source_id}
+        }' > "$co_body"
+
+    run_api drive.files.copy \
+        --path "fileId=$co_source_id" \
+        --query 'supportsAllDrives=true' \
+        --query 'fields=id,name,mimeType,parents,appProperties' \
+        --body "$co_body" > "$co_response"
+
+    result_id=$(jq -er '.id' "$co_response") ||
+        fail "Drive did not return an id while copying $co_name"
+
+    files_copied=$((files_copied + 1))
+    emit_event file copied "$co_source_id" "$result_id" "$co_name" "$co_mime_type"
+    rm -f -- "$co_body" "$co_response"
+}
+
+case ${1:-} in
+    -h|--help|'')
+        usage
+        exit 0
+        ;;
+esac
+
+[ "$#" -ge 1 ] && [ "$#" -le 2 ] || {
+    usage >&2
+    exit 2
+}
+
+need_command jq
+
+source_id=$(drive_id "$1")
+destination_reference=${2:-root}
+destination_requested_id=$(drive_id "$destination_reference")
+
+temporary_root=${TMPDIR:-/tmp}
+mkdir -p "$temporary_root"
+temporary=$(mktemp -d "$temporary_root/cloud-storage-drive-copy-tree.XXXXXX")
+cleanup() {
+    rm -rf "$temporary"
+}
+trap cleanup EXIT HUP INT TERM
+
+source_response=$temporary/source.json
+run_api drive.files.get \
+    --path "fileId=$source_id" \
+    --query 'supportsAllDrives=true' \
+    --query 'fields=id,name,mimeType,driveId,capabilities(canListChildren)' > "$source_response"
+
+source_mime=$(jq -r '.mimeType // empty' "$source_response")
+[ "$source_mime" = "$folder_mime" ] ||
+    fail "source is not a Drive folder: $source_id"
+
+source_can_list=$(jq -r '.capabilities.canListChildren // true' "$source_response")
+[ "$source_can_list" = true ] ||
+    fail "source folder cannot be listed by this account: $source_id"
+
+source_name=$(jq -er '.name' "$source_response")
+source_drive_id=$(jq -r '.driveId // empty' "$source_response")
+
+destination_response=$temporary/destination.json
+run_api drive.files.get \
+    --path "fileId=$destination_requested_id" \
+    --query 'supportsAllDrives=true' \
+    --query 'fields=id,name,mimeType,driveId,parents' > "$destination_response"
+
+destination_parent_id=$(jq -er '.id' "$destination_response")
+destination_mime=$(jq -r '.mimeType // empty' "$destination_response")
+[ "$destination_mime" = "$folder_mime" ] ||
+    fail "destination parent is not a Drive folder: $destination_requested_id"
+
+destination_drive_id=$(jq -r '.driveId // empty' "$destination_response")
+
+# Copying into the source or one of its descendants would make the newly
+# created copy appear in the traversal and recurse forever. Walk the destination
+# ancestry before creating anything and reject that topology.
+ancestor_id=$destination_parent_id
+while [ -n "$ancestor_id" ]; do
+    [ "$ancestor_id" != "$source_id" ] ||
+        fail 'destination parent is the source folder or one of its descendants'
+
+    ancestor_response=$(mktemp "$temporary/ancestor.XXXXXX")
+    run_api drive.files.get \
+        --path "fileId=$ancestor_id" \
+        --query 'supportsAllDrives=true' \
+        --query 'fields=id,parents' > "$ancestor_response"
+    ancestor_id=$(jq -r '.parents[0] // empty' "$ancestor_response")
+    rm -f -- "$ancestor_response"
+done
+
+folders_created=0
+folders_reused=0
+files_copied=0
+files_reused=0
+
+create_folder_copy "$source_id" "$source_name" "$destination_parent_id"
+destination_root_id=$result_id
+
+queue=$temporary/queue.tsv
+printf '%s\t%s\n' "$source_id" "$destination_root_id" > "$queue"
+queue_line=1
+tab=$(printf '\t')
+
+while :; do
+    queue_length=$(wc -l < "$queue" | tr -d '[:space:]')
+    [ "$queue_line" -le "$queue_length" ] || break
+
+    queue_record=$(sed -n "${queue_line}p" "$queue")
+    queue_source_id=${queue_record%%${tab}*}
+    queue_destination_id=${queue_record#*${tab}}
+
+    children=$(mktemp "$temporary/children.XXXXXX")
+    : > "$children"
+    page_token=
+
+    while :; do
+        child_query="'$queue_source_id' in parents and trashed=false"
+        set -- drive.files.list \
+            --query 'pageSize=1000' \
+            --query 'supportsAllDrives=true' \
+            --query 'includeItemsFromAllDrives=true' \
+            --query 'spaces=drive' \
+            --query "q=$child_query" \
+            --query 'fields=nextPageToken,files(id,name,mimeType,driveId,capabilities(canCopy,canListChildren),shortcutDetails)'
+
+        if [ -n "$source_drive_id" ]; then
+            set -- "$@" \
+                --query 'corpora=drive' \
+                --query "driveId=$source_drive_id"
+        fi
+        if [ -n "$page_token" ]; then
+            set -- "$@" --query "pageToken=$page_token"
+        fi
+
+        page_response=$(mktemp "$temporary/page.XXXXXX")
+        run_api "$@" > "$page_response"
+        jq -c '.files[]' "$page_response" >> "$children"
+        next_page_token=$(jq -r '.nextPageToken // empty' "$page_response")
+        rm -f -- "$page_response"
+
+        [ -n "$next_page_token" ] || break
+        page_token=$next_page_token
+    done
+
+    while IFS= read -r child_json; do
+        [ -n "$child_json" ] || continue
+
+        child_id=$(printf '%s\n' "$child_json" | jq -er '.id')
+        child_name=$(printf '%s\n' "$child_json" | jq -er '.name')
+        child_mime=$(printf '%s\n' "$child_json" | jq -er '.mimeType')
+
+        if [ "$child_mime" = "$folder_mime" ]; then
+            child_can_list=$(printf '%s\n' "$child_json" |
+                jq -r '.capabilities.canListChildren // true')
+            [ "$child_can_list" = true ] ||
+                fail "source subfolder cannot be listed by this account: $child_id"
+
+            create_folder_copy "$child_id" "$child_name" "$queue_destination_id"
+            child_destination_id=$result_id
+            printf '%s\t%s\n' "$child_id" "$child_destination_id" >> "$queue"
+        else
+            child_can_copy=$(printf '%s\n' "$child_json" |
+                jq -r '.capabilities.canCopy // true')
+            [ "$child_can_copy" = true ] ||
+                fail "source object cannot be copied by this account: $child_id ($child_name)"
+
+            copy_file_object "$child_id" "$child_name" "$child_mime" "$queue_destination_id"
+        fi
+    done < "$children"
+
+    rm -f -- "$children"
+    queue_line=$((queue_line + 1))
+done
+
+jq -cn \
+    --arg kind summary \
+    --arg source_id "$source_id" \
+    --arg destination_id "$destination_root_id" \
+    --argjson folders_created "$folders_created" \
+    --argjson folders_reused "$folders_reused" \
+    --argjson files_copied "$files_copied" \
+    --argjson files_reused "$files_reused" \
+    '{
+        kind: $kind,
+        source_id: $source_id,
+        destination_id: $destination_id,
+        folders_created: $folders_created,
+        folders_reused: $folders_reused,
+        files_copied: $files_copied,
+        files_reused: $files_reused
+    }'
