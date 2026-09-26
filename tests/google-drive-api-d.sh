@@ -79,7 +79,7 @@ permission_output=$(run_client permissions.create \
     --body "$body")
 [ "$permission_output" = '{"id":"PERM123"}' ]
 assert_log '"method":"POST","url":"/drive/v3/files/FILE123/permissions?supportsAllDrives=true"'
-assert_log '"body":"{\"type\":\"user\",\"role\":\"reader\",\"emailAddress\":\"reader@example.test\"}\\n"'
+assert_log '"body":"{\"type\":\"user\",\"role\":\"reader\",\"emailAddress\":\"reader@example.test\"}'
 
 printf '%s\n' 'stage: request validation' >&2
 if run_client files.get --query alt=media > /dev/null 2> "$temporary/missing-path.err"; then
