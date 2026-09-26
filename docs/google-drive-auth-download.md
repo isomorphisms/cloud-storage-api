@@ -106,6 +106,53 @@ google-drive-auth complete \
   < /explicit/private/path/callback-url
 ```
 
+### Android phone handoff through IB
+
+Google blocks OAuth authorization pages in embedded WebViews. The phone path
+therefore does not send the Google authorization endpoint to IB's WebView.
+Instead, IB invokes Google Identity Services and returns only the one-time
+server authorization code to this command over IPv4 loopback.
+
+In the same Google Cloud project, configure:
+
+- an Android OAuth client for package `org.isomorphisms.ib.webview`, using the
+  SHA-1 of the stable private certificate that signs the installed IB APK;
+- a Web application OAuth client for the server/offline authorization code.
+  Download that Web client JSON. No browser redirect URI is needed for this
+  local server-code exchange.
+
+Do not register a public or throwaway debug signing key for the Android client.
+The signing identity is part of the OAuth client identity.
+
+Import the Web client and start the private handoff:
+
+```sh
+google-drive-auth init-android \
+  /explicit/path/to/web-client-secret.json \
+  /explicit/private/path/google-drive.credentials \
+  --create-parent
+
+google-drive-auth authorize-android \
+  /explicit/private/path/google-drive.credentials
+```
+
+`authorize-android` binds the existing one-shot loopback receiver on a random
+`127.0.0.1` port and creates a fresh state value. On Termux it sends an
+`ib://google-drive-authorize?...` control URI directly to IB with
+`termux-open-url`; if that helper is unavailable, it prints the control URI.
+The URI contains only the Web client ID, requested read-only scope, state, and
+loopback port. It contains no client secret, authorization code, refresh token,
+or bearer token.
+
+IB must accept only the exact Drive read-only scope, obtain a server auth code
+through Google Identity Services, and return it to the supplied loopback port
+with the same state. The shell exchanges that code using the imported Web
+client, requires a refresh token and the Drive read-only scope, then writes the
+same mode-0600 credential format used by the Desktop flow.
+
+The Android flow is deliberately separate from the Desktop PKCE path above.
+It does not make successful Android authorization evidence a claim about the
+WebView, and it does not weaken the existing Desktop loopback contract.
 Ordinary commands then need only the credential location:
 
 ```sh
