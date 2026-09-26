@@ -73,6 +73,23 @@ Its list/get projection includes `hasThumbnail`, `thumbnailLink`,
 `thumbnailVersion`, image metadata, and video metadata so a viewer can maintain
 a local thumbnail cache without making those links part of durable identity.
 
+`commands/google-drive-copy-tree.grease` performs a server-side recursive copy
+of a Drive folder. It recreates the source folder below the chosen destination,
+walks every child page with `files.list`, creates destination folders with
+`files.create`, and copies files with `files.copy` without downloading their
+contents through the client.
+
+```sh
+google-drive-copy-tree SOURCE_FOLDER [DESTINATION_PARENT]
+```
+
+The destination defaults to My Drive root. The command emits NDJSON receipts
+containing the source and destination IDs. Each created object also receives a
+private `appProperties.cloud_storage_api_source_id` marker, so a rerun can
+reconcile an interrupted copy and reuse objects already created instead of
+duplicating them. It preserves the current file objects and content; it does not
+clone source permissions, comments, or revision history.
+
 `commands/google-drive-unzip.ysh` remains the separate Apps Script archive
 workflow for now. It is not a Drive v3 endpoint: the Drive API itself has no
 server-side unzip primitive.
