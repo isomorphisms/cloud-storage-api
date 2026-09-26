@@ -1,0 +1,524 @@
+#!/usr/bin/env grease
+set -eu
+LC_ALL=C
+export LC_ALL
+
+script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+api_command=${GOOGLE_DRIVE_API:-$script_directory/google-drive-api.grease}
+folder_mime=application/vnd.google-apps.folder
+shortcut_mime=application/vnd.google-apps.shortcut
+readonly_scope=https://www.googleapis.com/auth/drive.readonly
+file_scope=https://www.googleapis.com/auth/drive.file
+full_scope=https://www.googleapis.com/auth/drive
+
+usage() {
+    cat <<'USAGE'
+usage:
+  google-drive-copy-tree SOURCE_FOLDER DESTINATION_PARENT [--name NAME]
+
+Recursively make an independent server-side copy of a Google Drive folder tree.
+SOURCE_FOLDER and DESTINATION_PARENT may be raw Drive IDs or ordinary Drive URLs.
+
+The command creates one root folder under DESTINATION_PARENT, then recreates
+subfolders and uses Drive files.copy for ordinary files and Google Workspace
+files. File bytes do not pass through this process.
+
+Restartability:
+  Every created folder/file carries private appProperties linking it to the
+  source Drive ID (and source version for files). Re-running the same command
+  reuses already-created matching objects instead of blindly duplicating them.
+
+Output:
+  NDJSON records on stdout, ending with a summary record. A successful summary
+  has complete=true and source_items == destination_items. Redirect stdout to a
+  file when a durable local manifest is wanted.
+
+Limitations:
+  Drive shortcuts are reported as failures instead of copying a shortcut that
+  would still depend on the original target. Source permissions and revision
+  history are not copied. files.copy copies the current file state; open Google
+  Docs/Sheets/Slides comments are requested with copyComments=true.
+
+Authorization:
+  Use a credential containing drive.readonly + drive.file, for example:
+    google-drive-auth authorize CREDENTIAL_FILE --copy-tree
+  A full drive scope token also works. Existing read-only credentials remain
+  valid for read-only commands but cannot create the archive copy.
+USAGE
+}
+
+fail() {
+    printf '%s\n' "$*" >&2
+    exit 2
+}
+
+need_command() {
+    command -v "$1" >/dev/null 2>&1 || {
+        printf 'google-drive-copy-tree needs %s\n' "$1" >&2
+        exit 127
+    }
+}
+
+drive_id() {
+    value=$1
+    case $value in
+        *'/d/'*)
+            value=${value#*/d/}
+            value=${value%%/*}
+            ;;
+        *'/folders/'*)
+            value=${value#*/folders/}
+            value=${value%%/*}
+            ;;
+        *'id='*)
+            value=${value#*id=}
+            value=${value%%&*}
+            ;;
+    esac
+    value=${value%%\?*}
+    value=${value%%\#*}
+    [ -n "$value" ] || fail 'empty Google Drive id'
+    printf '%s\n' "$value"
+}
+
+run_api() {
+    if [ -n "${GREASE:-}" ]; then
+        "$GREASE" "$api_command" "$@"
+    else
+        "$api_command" "$@"
+    fi
+}
+
+scope_contains() {
+    scope_list=$1
+    wanted_scope=$2
+    case " $scope_list " in
+        *" $wanted_scope "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+preflight_credential_scope() {
+    [ -n "${GOOGLE_DRIVE_CREDENTIAL_FILE:-}" ] || return 0
+    credential_file=$GOOGLE_DRIVE_CREDENTIAL_FILE
+    [ -f "$credential_file" ] || fail "Google Drive credential not found: $credential_file"
+    stored_scope=$(sed -n 's/^scope=//p' "$credential_file" | tail -n 1)
+    if scope_contains "$stored_scope" "$full_scope"; then
+        return 0
+    fi
+    if scope_contains "$stored_scope" "$readonly_scope" &&
+       scope_contains "$stored_scope" "$file_scope"
+    then
+        return 0
+    fi
+    fail 'copy-tree needs drive.readonly + drive.file; reauthorize this credential with google-drive-auth authorize ... --copy-tree'
+}
+
+drive_query_literal() {
+    jq -rn --arg value "$1" \
+        '$value | gsub("\\\\"; "\\\\\\\\") | gsub("\u0027"; "\\\u0027")'
+}
+
+emit_record() {
+    printf '%s\n' "$1"
+}
+
+record_failure() {
+    source_id=$1
+    source_name=$2
+    source_mime=$3
+    reason=$4
+    failed_count=$((failed_count + 1))
+    emit_record "$(jq -cn \
+        --arg kind item \
+        --arg status failed \
+        --arg source_id "$source_id" \
+        --arg name "$source_name" \
+        --arg mime_type "$source_mime" \
+        --arg reason "$reason" \
+        '{kind:$kind,status:$status,source_id:$source_id,name:$name,mime_type:$mime_type,reason:$reason}')"
+}
+
+source_metadata() {
+    source_metadata_id=$1
+    run_api drive.files.get \
+        --path "fileId=$source_metadata_id" \
+        --query 'supportsAllDrives=true' \
+        --query 'fields=id,name,mimeType,size,createdTime,modifiedTime,version,sha256Checksum,resourceKey,shortcutDetails,capabilities(canCopy)'
+}
+
+destination_metadata() {
+    destination_metadata_id=$1
+    run_api drive.files.get \
+        --path "fileId=$destination_metadata_id" \
+        --query 'supportsAllDrives=true' \
+        --query 'fields=id,name,mimeType,parents,capabilities(canAddChildren)'
+}
+
+list_children() {
+    parent_source_id=$1
+    output_file=$2
+    : > "$output_file"
+    escaped_parent=$(drive_query_literal "$parent_source_id")
+    page=
+    while :; do
+        set -- drive.files.list \
+            --query 'pageSize=1000' \
+            --query 'supportsAllDrives=true' \
+            --query 'includeItemsFromAllDrives=true' \
+            --query 'spaces=drive' \
+            --query "q='$escaped_parent' in parents and trashed=false" \
+            --query 'fields=nextPageToken,incompleteSearch,files(id,name,mimeType,size,createdTime,modifiedTime,version,sha256Checksum,resourceKey,shortcutDetails,capabilities(canCopy))'
+        if [ -n "$page" ]; then
+            set -- "$@" --query "pageToken=$page"
+        fi
+        response=$(run_api "$@")
+        printf '%s' "$response" | jq -ce '.files | arrays' >/dev/null ||
+            fail "Drive returned an invalid child list for $parent_source_id"
+        if printf '%s' "$response" | jq -e '.incompleteSearch == true' >/dev/null; then
+            fail "Drive reported an incomplete child search for $parent_source_id"
+        fi
+        printf '%s' "$response" | jq -c '.files[]' >> "$output_file"
+        page=$(printf '%s' "$response" | jq -r '.nextPageToken // ""')
+        [ -n "$page" ] || break
+    done
+}
+
+find_existing() {
+    source_id=$1
+    source_version=$2
+    role=$3
+    parent_destination_id=$4
+
+    escaped_source=$(drive_query_literal "$source_id")
+    escaped_root=$(drive_query_literal "$source_root_id")
+    escaped_parent=$(drive_query_literal "$parent_destination_id")
+    escaped_role=$(drive_query_literal "$role")
+
+    provider_query="'$escaped_parent' in parents and trashed=false and appProperties has { key='cloud_storage_api_source_id' and value='$escaped_source' } and appProperties has { key='cloud_storage_api_copy_root' and value='$escaped_root' } and appProperties has { key='cloud_storage_api_copy_role' and value='$escaped_role' }"
+    if [ -n "$source_version" ]; then
+        escaped_version=$(drive_query_literal "$source_version")
+        provider_query="$provider_query and appProperties has { key='cloud_storage_api_source_version' and value='$escaped_version' }"
+    fi
+
+    existing_response=$(run_api drive.files.list \
+        --query 'pageSize=2' \
+        --query 'supportsAllDrives=true' \
+        --query 'includeItemsFromAllDrives=true' \
+        --query 'spaces=drive' \
+        --query "q=$provider_query" \
+        --query 'fields=incompleteSearch,files(id,name,mimeType,size,modifiedTime,version,sha256Checksum,parents,appProperties)')
+    if printf '%s' "$existing_response" | jq -e '.incompleteSearch == true' >/dev/null; then
+        fail "Drive reported an incomplete reconciliation search for source $source_id"
+    fi
+    existing_count=$(printf '%s' "$existing_response" | jq -er '.files | length') ||
+        fail 'Drive returned an invalid reconciliation result'
+    [ "$existing_count" -le 1 ] || fail "more than one destination object claims source $source_id under parent $parent_destination_id"
+    if [ "$existing_count" -eq 1 ]; then
+        existing_json=$(printf '%s' "$existing_response" | jq -c '.files[0]')
+    else
+        existing_json=
+    fi
+}
+
+create_or_reuse_folder() {
+    source_json=$1
+    parent_destination_id=$2
+    role=$3
+    override_name=${4:-}
+
+    source_id=$(printf '%s' "$source_json" | jq -er '.id')
+    source_name=$(printf '%s' "$source_json" | jq -er '.name')
+    if [ -n "$override_name" ]; then destination_name=$override_name; else destination_name=$source_name; fi
+
+    find_existing "$source_id" '' "$role" "$parent_destination_id"
+    if [ -n "$existing_json" ]; then
+        existing_mime=$(printf '%s' "$existing_json" | jq -er '.mimeType')
+        existing_name=$(printf '%s' "$existing_json" | jq -er '.name')
+        if [ "$existing_mime" != "$folder_mime" ]; then
+            record_failure "$source_id" "$source_name" "$folder_mime" 'reconciliation object is not a folder'
+            resolved_destination_id=
+            return 0
+        fi
+        if [ "$existing_name" != "$destination_name" ]; then
+            record_failure "$source_id" "$source_name" "$folder_mime" 'reconciliation folder name differs from requested copy name'
+            resolved_destination_id=
+            return 0
+        fi
+        resolved_destination_id=$(printf '%s' "$existing_json" | jq -er '.id')
+        reused_count=$((reused_count + 1))
+        destination_folder_count=$((destination_folder_count + 1))
+        emit_record "$(jq -cn \
+            --arg kind item --arg status reused --arg source_id "$source_id" \
+            --arg destination_id "$resolved_destination_id" --arg name "$destination_name" \
+            --arg mime_type "$folder_mime" \
+            '{kind:$kind,status:$status,source_id:$source_id,destination_id:$destination_id,name:$name,mime_type:$mime_type}')"
+        return 0
+    fi
+
+    body_file=$temporary/folder-body.json
+    jq -cn \
+        --arg name "$destination_name" \
+        --arg parent "$parent_destination_id" \
+        --arg source "$source_id" \
+        --arg root "$source_root_id" \
+        --arg role "$role" \
+        '{name:$name,mimeType:"application/vnd.google-apps.folder",parents:[$parent],appProperties:{cloud_storage_api_source_id:$source,cloud_storage_api_copy_root:$root,cloud_storage_api_copy_role:$role}}' \
+        > "$body_file"
+
+    if created_json=$(run_api drive.files.create \
+        --query 'supportsAllDrives=true' \
+        --query 'fields=id,name,mimeType,parents,appProperties' \
+        --body "$body_file")
+    then
+        resolved_destination_id=$(printf '%s' "$created_json" | jq -er '.id') ||
+            fail 'Drive created a folder but returned no id'
+        created_count=$((created_count + 1))
+        destination_folder_count=$((destination_folder_count + 1))
+        emit_record "$(jq -cn \
+            --arg kind item --arg status created --arg source_id "$source_id" \
+            --arg destination_id "$resolved_destination_id" --arg name "$destination_name" \
+            --arg mime_type "$folder_mime" \
+            '{kind:$kind,status:$status,source_id:$source_id,destination_id:$destination_id,name:$name,mime_type:$mime_type}')"
+    else
+        record_failure "$source_id" "$source_name" "$folder_mime" 'Drive files.create failed'
+        resolved_destination_id=
+    fi
+}
+
+copy_or_reuse_file() {
+    source_json=$1
+    parent_destination_id=$2
+
+    source_id=$(printf '%s' "$source_json" | jq -er '.id')
+    source_name=$(printf '%s' "$source_json" | jq -er '.name')
+    source_mime=$(printf '%s' "$source_json" | jq -er '.mimeType')
+    source_version=$(printf '%s' "$source_json" | jq -r '.version // "0" | tostring')
+    source_size=$(printf '%s' "$source_json" | jq -r '.size // "" | tostring')
+    source_sha256=$(printf '%s' "$source_json" | jq -r '.sha256Checksum // ""')
+    source_modified=$(printf '%s' "$source_json" | jq -r '.modifiedTime // ""')
+    can_copy=$(printf '%s' "$source_json" | jq -r '.capabilities.canCopy // false')
+
+    if [ "$can_copy" != true ]; then
+        record_failure "$source_id" "$source_name" "$source_mime" 'source capabilities.canCopy is not true'
+        return 0
+    fi
+
+    find_existing "$source_id" "$source_version" file "$parent_destination_id"
+    if [ -n "$existing_json" ]; then
+        existing_id=$(printf '%s' "$existing_json" | jq -er '.id')
+        existing_name=$(printf '%s' "$existing_json" | jq -er '.name')
+        existing_mime=$(printf '%s' "$existing_json" | jq -er '.mimeType')
+        existing_size=$(printf '%s' "$existing_json" | jq -r '.size // "" | tostring')
+        existing_sha256=$(printf '%s' "$existing_json" | jq -r '.sha256Checksum // ""')
+        if [ "$existing_name" != "$source_name" ] || [ "$existing_mime" != "$source_mime" ]; then
+            record_failure "$source_id" "$source_name" "$source_mime" 'reconciliation object name or MIME type differs from source'
+            return 0
+        fi
+        if [ -n "$source_size" ] && [ "$source_size" != "$existing_size" ]; then
+            record_failure "$source_id" "$source_name" "$source_mime" 'reconciliation object size differs from source'
+            return 0
+        fi
+        if [ -n "$source_sha256" ] && [ "$source_sha256" != "$existing_sha256" ]; then
+            record_failure "$source_id" "$source_name" "$source_mime" 'reconciliation object SHA-256 differs from source'
+            return 0
+        fi
+        reused_count=$((reused_count + 1))
+        destination_file_count=$((destination_file_count + 1))
+        emit_record "$(jq -cn \
+            --arg kind item --arg status reused --arg source_id "$source_id" \
+            --arg source_version "$source_version" --arg destination_id "$existing_id" \
+            --arg name "$source_name" --arg mime_type "$source_mime" \
+            '{kind:$kind,status:$status,source_id:$source_id,source_version:$source_version,destination_id:$destination_id,name:$name,mime_type:$mime_type}')"
+        return 0
+    fi
+
+    body_file=$temporary/file-body.json
+    jq -cn \
+        --arg name "$source_name" \
+        --arg parent "$parent_destination_id" \
+        --arg source "$source_id" \
+        --arg source_version "$source_version" \
+        --arg root "$source_root_id" \
+        --arg modified "$source_modified" \
+        '{name:$name,parents:[$parent],appProperties:{cloud_storage_api_source_id:$source,cloud_storage_api_source_version:$source_version,cloud_storage_api_copy_root:$root,cloud_storage_api_copy_role:"file"}} + (if $modified == "" then {} else {modifiedTime:$modified} end)' \
+        > "$body_file"
+
+    if copied_json=$(run_api drive.files.copy \
+        --path "fileId=$source_id" \
+        --query 'supportsAllDrives=true' \
+        --query 'copyComments=true' \
+        --query 'fields=id,name,mimeType,size,modifiedTime,version,sha256Checksum,parents,appProperties' \
+        --body "$body_file")
+    then
+        copied_id=$(printf '%s' "$copied_json" | jq -er '.id') ||
+            fail 'Drive copied a file but returned no id'
+        copied_size=$(printf '%s' "$copied_json" | jq -r '.size // "" | tostring')
+        copied_sha256=$(printf '%s' "$copied_json" | jq -r '.sha256Checksum // ""')
+        if [ -n "$source_size" ] && [ "$source_size" != "$copied_size" ]; then
+            record_failure "$source_id" "$source_name" "$source_mime" 'new copy size differs from source'
+            return 0
+        fi
+        if [ -n "$source_sha256" ] && [ "$source_sha256" != "$copied_sha256" ]; then
+            record_failure "$source_id" "$source_name" "$source_mime" 'new copy SHA-256 differs from source'
+            return 0
+        fi
+        created_count=$((created_count + 1))
+        destination_file_count=$((destination_file_count + 1))
+        emit_record "$(jq -cn \
+            --arg kind item --arg status created --arg source_id "$source_id" \
+            --arg source_version "$source_version" --arg destination_id "$copied_id" \
+            --arg name "$source_name" --arg mime_type "$source_mime" \
+            '{kind:$kind,status:$status,source_id:$source_id,source_version:$source_version,destination_id:$destination_id,name:$name,mime_type:$mime_type}')"
+    else
+        record_failure "$source_id" "$source_name" "$source_mime" 'Drive files.copy failed'
+    fi
+}
+
+copy_descendants() {
+    queue_read=1
+    queue_write=1
+    jq -cn \
+        --arg source "$source_root_id" \
+        --arg destination "$destination_root_id" \
+        '{source:$source,destination:$destination}' \
+        > "$temporary/queue.1.json"
+
+    while [ "$queue_read" -le "$queue_write" ]; do
+        queue_entry=$temporary/queue.$queue_read.json
+        current_source_parent=$(jq -er '.source' "$queue_entry")
+        current_destination_parent=$(jq -r '.destination // ""' "$queue_entry")
+        queue_read=$((queue_read + 1))
+
+        children_file=$(mktemp "$temporary/children.XXXXXX")
+        list_children "$current_source_parent" "$children_file"
+
+        while IFS= read -r child_json; do
+            [ -n "$child_json" ] || continue
+            child_id=$(printf '%s' "$child_json" | jq -er '.id')
+            child_name=$(printf '%s' "$child_json" | jq -er '.name')
+            child_mime=$(printf '%s' "$child_json" | jq -er '.mimeType')
+            source_item_count=$((source_item_count + 1))
+
+            case $child_mime in
+                "$folder_mime")
+                    source_folder_count=$((source_folder_count + 1))
+                    if [ -n "$current_destination_parent" ]; then
+                        create_or_reuse_folder "$child_json" "$current_destination_parent" folder ''
+                        child_destination_id=$resolved_destination_id
+                    else
+                        record_failure "$child_id" "$child_name" "$child_mime" \
+                            'ancestor destination folder was not created'
+                        child_destination_id=
+                    fi
+
+                    queue_write=$((queue_write + 1))
+                    jq -cn \
+                        --arg source "$child_id" \
+                        --arg destination "$child_destination_id" \
+                        '{source:$source,destination:(if $destination=="" then null else $destination end)}' \
+                        > "$temporary/queue.$queue_write.json"
+                    ;;
+                "$shortcut_mime")
+                    source_file_count=$((source_file_count + 1))
+                    record_failure "$child_id" "$child_name" "$child_mime" \
+                        'Drive shortcut not archived because copying it would retain dependency on the original target'
+                    ;;
+                *)
+                    source_file_count=$((source_file_count + 1))
+                    if [ -n "$current_destination_parent" ]; then
+                        copy_or_reuse_file "$child_json" "$current_destination_parent"
+                    else
+                        record_failure "$child_id" "$child_name" "$child_mime" \
+                            'ancestor destination folder was not created'
+                    fi
+                    ;;
+            esac
+        done < "$children_file"
+        rm -f -- "$children_file" "$queue_entry"
+    done
+}
+
+case ${1:-} in
+    -h|--help|'') usage; exit 0 ;;
+esac
+
+[ "$#" -ge 2 ] || { usage >&2; exit 2; }
+source_root_id=$(drive_id "$1")
+destination_parent_id=$(drive_id "$2")
+shift 2
+copy_name=
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --name)
+            [ "$#" -ge 2 ] || fail '--name needs a value'
+            copy_name=$2
+            [ -n "$copy_name" ] || fail '--name must not be empty'
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown option: $1" ;;
+    esac
+done
+
+need_command jq
+preflight_credential_scope
+
+temporary_root=${TMPDIR:-/tmp}
+mkdir -p "$temporary_root"
+temporary=$(mktemp -d "$temporary_root/cloud-storage-copy-tree.XXXXXX")
+cleanup() { rm -rf -- "$temporary"; }
+trap cleanup EXIT HUP INT TERM
+
+source_root_json=$(source_metadata "$source_root_id")
+source_root_mime=$(printf '%s' "$source_root_json" | jq -er '.mimeType') || fail 'source metadata has no MIME type'
+[ "$source_root_mime" = "$folder_mime" ] || fail 'SOURCE_FOLDER is not a Google Drive folder'
+source_root_name=$(printf '%s' "$source_root_json" | jq -er '.name') || fail 'source folder has no name'
+if [ -z "$copy_name" ]; then copy_name=$source_root_name; fi
+
+destination_parent_json=$(destination_metadata "$destination_parent_id")
+destination_parent_mime=$(printf '%s' "$destination_parent_json" | jq -er '.mimeType') || fail 'destination metadata has no MIME type'
+[ "$destination_parent_mime" = "$folder_mime" ] || fail 'DESTINATION_PARENT is not a Google Drive folder'
+can_add_children=$(printf '%s' "$destination_parent_json" | jq -r '.capabilities.canAddChildren // false')
+[ "$can_add_children" = true ] || fail 'DESTINATION_PARENT does not allow this account to add children'
+
+source_item_count=1
+source_folder_count=1
+source_file_count=0
+destination_folder_count=0
+destination_file_count=0
+created_count=0
+reused_count=0
+failed_count=0
+
+create_or_reuse_folder "$source_root_json" "$destination_parent_id" tree-root "$copy_name"
+destination_root_id=$resolved_destination_id
+copy_descendants
+
+destination_item_count=$((destination_folder_count + destination_file_count))
+complete=false
+if [ "$failed_count" -eq 0 ] && [ "$source_item_count" -eq "$destination_item_count" ]; then
+    complete=true
+fi
+
+emit_record "$(jq -cn \
+    --arg kind summary \
+    --arg source_root_id "$source_root_id" \
+    --arg destination_parent_id "$destination_parent_id" \
+    --arg destination_root_id "$destination_root_id" \
+    --argjson source_items "$source_item_count" \
+    --argjson source_folders "$source_folder_count" \
+    --argjson source_files "$source_file_count" \
+    --argjson destination_items "$destination_item_count" \
+    --argjson destination_folders "$destination_folder_count" \
+    --argjson destination_files "$destination_file_count" \
+    --argjson created "$created_count" \
+    --argjson reused "$reused_count" \
+    --argjson failed "$failed_count" \
+    --argjson complete "$complete" \
+    '{kind:$kind,source_root_id:$source_root_id,destination_parent_id:$destination_parent_id,destination_root_id:(if $destination_root_id=="" then null else $destination_root_id end),source_items:$source_items,source_folders:$source_folders,source_files:$source_files,destination_items:$destination_items,destination_folders:$destination_folders,destination_files:$destination_files,created:$created,reused:$reused,failed:$failed,complete:$complete}')"
+
+[ "$complete" = true ] || exit 1

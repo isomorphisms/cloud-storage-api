@@ -55,7 +55,7 @@ if grep -F 'grant_type=authorization_code' "$form" >/dev/null; then
     if [ "${FAKE_SCOPE_FAILURE:-0}" = 1 ]; then
         printf '%s\n' '{"access_token":"ACCESS_WRONG_SCOPE","expires_in":3600,"refresh_token":"REFRESH_WRONG_SCOPE","scope":"https://www.googleapis.com/auth/drive.metadata.readonly","token_type":"Bearer"}' > "$output"
     else
-        printf '%s\n' '{"access_token":"ACCESS_INITIAL","expires_in":3600,"refresh_token":"REFRESH_LONG_LIVED","scope":"https://www.googleapis.com/auth/drive.readonly","token_type":"Bearer"}' > "$output"
+        printf '%s\n' '{"access_token":"ACCESS_INITIAL","expires_in":3600,"refresh_token":"REFRESH_LONG_LIVED","scope":"https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file","token_type":"Bearer"}' > "$output"
     fi
     printf '%s' 200
 elif grep -F 'grant_type=refresh_token' "$form" >/dev/null; then
@@ -64,7 +64,7 @@ elif grep -F 'grant_type=refresh_token' "$form" >/dev/null; then
         printf '%s' 400
         exit 22
     fi
-    printf '%s\n' '{"access_token":"ACCESS_REFRESHED","expires_in":3600,"scope":"https://www.googleapis.com/auth/drive.readonly","token_type":"Bearer"}' > "$output"
+    printf '%s\n' '{"access_token":"ACCESS_REFRESHED","expires_in":3600,"scope":"https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file","token_type":"Bearer"}' > "$output"
     printf '%s' 200
 else
     exit 92
@@ -96,6 +96,14 @@ authorization_url=$(common_env begin "$credential" http://127.0.0.1:53682)
 printf '%s\n' "$authorization_url" | grep -F 'https://accounts.example.test/auth?' >/dev/null
 printf '%s\n' "$authorization_url" | grep -F 'scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.readonly' >/dev/null
 printf '%s\n' "$authorization_url" | grep -F 'code_challenge_method=S256' >/dev/null
+
+copy_scope_credential=$temporary/config/google-drive-copy-scope.credentials
+common_env init "$client_json" "$copy_scope_credential" >/dev/null
+copy_scope_url=$(common_env begin "$copy_scope_credential" http://127.0.0.1:53683 --copy-tree)
+printf '%s\n' "$copy_scope_url" | grep -F 'scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.readonly%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file' >/dev/null
+grep -F 'scope=https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file' "$copy_scope_credential.pending" >/dev/null
+common_env cancel "$copy_scope_credential" >/dev/null
+
 if printf '%s\n' "$authorization_url" | grep -F 'CLIENT_SECRET' >/dev/null; then
     printf '%s\n' 'client secret leaked into authorization URL' >&2
     exit 1
@@ -193,7 +201,7 @@ then
     exit 1
 fi
 unset FAKE_SCOPE_FAILURE
-grep -F 'did not grant the required Drive read-only scope' "$temporary/scope.err" >/dev/null
+grep -F 'did not grant the requested Drive OAuth scope set' "$temporary/scope.err" >/dev/null
 
 android_client_json=$temporary/android-web-client.json
 cat > "$android_client_json" <<'EOF_ANDROID_CLIENT'
@@ -215,7 +223,7 @@ grep -F 'client_id=ANDROID_WEB_CLIENT.apps.googleusercontent.com' "$android_cred
 
 android_stdout=$temporary/android-authorize.stdout
 android_stderr=$temporary/android-authorize.stderr
-common_env authorize-android "$android_credential" --no-open --timeout 20 \
+common_env authorize-android "$android_credential" --copy-tree --no-open --timeout 20 \
     >"$android_stdout" 2>"$android_stderr" &
 android_pid=$!
 attempt=0
@@ -232,7 +240,7 @@ done
 control_uri=$(sed -n '/^ib:\/\/google-drive-authorize?/p' "$android_stdout" | head -n 1)
 [ -n "$control_uri" ]
 printf '%s\n' "$control_uri" | grep -F 'client_id=ANDROID_WEB_CLIENT.apps.googleusercontent.com' >/dev/null
-printf '%s\n' "$control_uri" | grep -F 'scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.readonly' >/dev/null
+printf '%s\n' "$control_uri" | grep -F 'scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.readonly%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file' >/dev/null
 android_state=$(printf '%s\n' "$control_uri" | sed -n 's/.*&state=\([^&]*\)&port=.*/\1/p')
 android_port=$(printf '%s\n' "$control_uri" | sed -n 's/.*&port=\([0-9][0-9]*\)$/\1/p')
 [ -n "$android_state" ] && [ -n "$android_port" ]
@@ -241,7 +249,7 @@ android_port=$(printf '%s\n' "$control_uri" | sed -n 's/.*&port=\([0-9][0-9]*\)$
 wait "$android_pid"
 grep -F 'refresh_token=REFRESH_LONG_LIVED' "$android_credential" >/dev/null
 grep -F 'access_token=ACCESS_INITIAL' "$android_credential" >/dev/null
-grep -F 'scope=https://www.googleapis.com/auth/drive.readonly' "$android_credential" >/dev/null
+grep -Fx 'scope=https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file' "$android_credential" >/dev/null
 android_form=$(tail -n 1 "$form_log")
 printf '%s\n' "$android_form" | grep -F 'code=ANDROID_SERVER_AUTH_CODE' >/dev/null
 printf '%s\n' "$android_form" | grep -F 'redirect_uri=&grant_type=authorization_code' >/dev/null

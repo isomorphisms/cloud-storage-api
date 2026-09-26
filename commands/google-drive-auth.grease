@@ -24,6 +24,8 @@ fi
 grease_runner=${GREASE:-grease}
 
 readonly_scope=https://www.googleapis.com/auth/drive.readonly
+file_scope=https://www.googleapis.com/auth/drive.file
+copy_tree_scope="$readonly_scope $file_scope"
 authorization_endpoint=https://accounts.google.com/o/oauth2/v2/auth
 token_endpoint=https://oauth2.googleapis.com/token
 
@@ -39,18 +41,19 @@ usage() {
     cat <<'USAGE'
 usage:
   google-drive-auth init CLIENT_JSON CREDENTIAL_FILE [--create-parent]
-  google-drive-auth authorize CREDENTIAL_FILE [--no-open] [--timeout SECONDS]
+  google-drive-auth authorize CREDENTIAL_FILE [--copy-tree] [--no-open] [--timeout SECONDS]
   google-drive-auth init-android WEB_CLIENT_JSON CREDENTIAL_FILE [--create-parent]
-  google-drive-auth authorize-android CREDENTIAL_FILE [--no-open] [--timeout SECONDS]
-  google-drive-auth begin CREDENTIAL_FILE REDIRECT_URI
+  google-drive-auth authorize-android CREDENTIAL_FILE [--copy-tree] [--no-open] [--timeout SECONDS]
+  google-drive-auth begin CREDENTIAL_FILE REDIRECT_URI [--copy-tree]
   google-drive-auth complete CREDENTIAL_FILE < CALLBACK_URL
   google-drive-auth curl-config CREDENTIAL_FILE OUTPUT [--force-refresh]
   google-drive-auth status CREDENTIAL_FILE
   google-drive-auth cancel CREDENTIAL_FILE
 
-Create and maintain a private installed-application OAuth credential for
-read-only Google Drive access. Durable state is an ordinary mode-0600 file,
-not a checked-in configuration or a repeatedly copied access token.
+Create and maintain a private Google Drive OAuth credential. Authorization is
+read-only by default. Pass --copy-tree when the credential must also create
+independent Drive copies. Durable state is an ordinary mode-0600 file, not a
+checked-in configuration or a repeatedly copied access token.
 
 init imports the "installed" Desktop client from Google's downloaded client
 JSON into the private plain-text credential file. authorize uses PKCE, a random
@@ -63,10 +66,13 @@ IB obtains the one-time server authorization code through Google Play services
 and returns it only to the loopback receiver. No embedded WebView is used for
 the Google consent surface.
 
-Both paths request the least privilege that can discover and read an existing
-Takeout object:
+By default both paths request only:
 
   https://www.googleapis.com/auth/drive.readonly
+
+--copy-tree additionally requests drive.file. The resulting credential can read
+accessible source files and create/reconcile the independent copies made by the
+copy-tree command without requesting the broad drive scope.
 
 For a remote/headless shell, begin writes a pending request and prints an
 authorization URL for an explicit loopback REDIRECT_URI. After the browser
@@ -185,6 +191,15 @@ scope_contains() {
     esac
 }
 
+scope_contains_all() {
+    granted_scopes=$1
+    required_scopes=$2
+    for required_scope in $required_scopes; do
+        scope_contains "$granted_scopes" "$required_scope" || return 1
+    done
+    return 0
+}
+
 credential_values() {
     validate_private_file "$credential_file" 'OAuth credential file'
     client_id=$(require_field client_id "$credential_file")
@@ -203,8 +218,11 @@ credential_values() {
     refresh_token=$(read_field refresh_token "$credential_file")
     access_token=$(read_field access_token "$credential_file")
     access_token_expires_at=$(read_field access_token_expires_at "$credential_file")
-    if [ -n "$stored_scope" ] && [ "$stored_scope" != "$readonly_scope" ]; then
-        fail 'credential file contains an unsupported OAuth scope set'
+    if [ -n "$stored_scope" ]; then
+        case $stored_scope in
+            "$readonly_scope"|"$copy_tree_scope"|"$file_scope $readonly_scope") ;;
+            *) fail 'credential file contains an unsupported OAuth scope set' ;;
+        esac
     fi
     if [ -n "$refresh_token" ]; then validate_opaque_value refresh_token "$refresh_token"; fi
     if [ -n "$access_token" ]; then validate_opaque_value access_token "$access_token"; fi
@@ -244,7 +262,7 @@ write_android_pending() {
     {
         printf '%s\n' 'schema=google-drive-android-pending-v1'
         printf 'state=%s\n' "$state"
-        printf 'scope=%s\n' "$readonly_scope"
+        printf 'scope=%s\n' "$authorization_scope"
         printf 'created_at=%s\n' "$created_at"
     } > "$pending_file"
     chmod 600 "$pending_file"
@@ -266,7 +284,7 @@ write_pending() {
         printf 'state=%s\n' "$state"
         printf 'code_verifier=%s\n' "$verifier"
         printf 'code_challenge=%s\n' "$challenge"
-        printf 'scope=%s\n' "$readonly_scope"
+        printf 'scope=%s\n' "$authorization_scope"
         printf 'redirect_uri=%s\n' "$redirect_uri"
         printf 'created_at=%s\n' "$created_at"
     } > "$pending_file"
@@ -323,7 +341,7 @@ token_error() {
             runtime_fail 'Google rejected the OAuth client credentials'
             ;;
         invalid_scope)
-            runtime_fail 'Google rejected the requested Drive read-only scope'
+            runtime_fail 'Google rejected the requested Drive OAuth scope set'
             ;;
         *)
             runtime_fail "Google OAuth token request failed: $error_code"
@@ -425,9 +443,9 @@ exchange_android_result() {
     }
     validate_opaque_value refresh_token "$refresh_token"
     returned_scope=$(jq -r '.scope // "" | if type == "string" then . else "" end' "$response_file")
-    if [ -n "$returned_scope" ] && ! scope_contains "$returned_scope" "$readonly_scope"; then
+    if [ -n "$returned_scope" ] && ! scope_contains_all "$returned_scope" "$requested_scope"; then
         rm -rf -- "$exchange_temporary"
-        runtime_fail 'Google did not grant the required Drive read-only scope'
+        runtime_fail 'Google did not grant the requested Drive OAuth scope set'
     fi
     stored_scope=$requested_scope
     write_credentials
@@ -474,9 +492,9 @@ exchange_result() {
     }
     validate_opaque_value refresh_token "$refresh_token"
     returned_scope=$(jq -r '.scope // "" | if type == "string" then . else "" end' "$response_file")
-    if [ -n "$returned_scope" ] && ! scope_contains "$returned_scope" "$readonly_scope"; then
+    if [ -n "$returned_scope" ] && ! scope_contains_all "$returned_scope" "$requested_scope"; then
         rm -rf -- "$exchange_temporary"
-        runtime_fail 'Google did not grant the required Drive read-only scope'
+        runtime_fail 'Google did not grant the requested Drive OAuth scope set'
     fi
     stored_scope=$requested_scope
     write_credentials
@@ -490,7 +508,7 @@ refresh_access_token() {
     [ -n "$refresh_token" ] || runtime_fail 'authorization required; run google-drive-auth authorize first'
     requested_scope=${stored_scope:-$readonly_scope}
     scope_contains "$requested_scope" "$readonly_scope" ||
-        runtime_fail 'stored credential lacks the required Drive read-only scope; authorize again'
+        runtime_fail 'stored credential lacks the required Drive read scope; authorize again'
 
     temporary_root=${TMPDIR:-/tmp}
     refresh_temporary=$(mktemp -d "$temporary_root/cloud-storage-oauth-refresh.XXXXXX")
@@ -510,9 +528,9 @@ refresh_access_token() {
         refresh_token=$rotated_refresh
     fi
     returned_scope=$(jq -r '.scope // "" | if type == "string" then . else "" end' "$response_file")
-    if [ -n "$returned_scope" ] && ! scope_contains "$returned_scope" "$readonly_scope"; then
+    if [ -n "$returned_scope" ] && ! scope_contains_all "$returned_scope" "$requested_scope"; then
         rm -rf -- "$refresh_temporary"
-        runtime_fail 'refreshed credential lacks the required Drive read-only scope'
+        runtime_fail 'refreshed credential lacks the requested Drive OAuth scope set'
     fi
     write_credentials
     rm -rf -- "$refresh_temporary"
@@ -602,9 +620,17 @@ command_init_android() {
 }
 
 command_begin() {
-    [ "$#" -eq 2 ] || fail 'begin needs CREDENTIAL_FILE REDIRECT_URI'
+    [ "$#" -ge 2 ] || fail 'begin needs CREDENTIAL_FILE REDIRECT_URI [--copy-tree]'
     credential_file=$1
     manual_redirect=$2
+    shift 2
+    authorization_scope=$readonly_scope
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --copy-tree) authorization_scope=$copy_tree_scope; shift ;;
+            *) fail "unknown begin option: $1" ;;
+        esac
+    done
     case $manual_redirect in
         http://127.0.0.1:*) ;;
         *) fail 'REDIRECT_URI must use an explicit http://127.0.0.1:PORT loopback address' ;;
@@ -628,8 +654,10 @@ command_authorize() {
     shift
     no_open=no
     callback_timeout=300
+    authorization_scope=$readonly_scope
     while [ "$#" -gt 0 ]; do
         case $1 in
+            --copy-tree) authorization_scope=$copy_tree_scope; shift ;;
             --no-open) no_open=yes; shift ;;
             --timeout)
                 [ "$#" -ge 2 ] || fail '--timeout needs seconds'
@@ -708,8 +736,10 @@ command_authorize_android() {
     shift
     no_open=no
     callback_timeout=300
+    authorization_scope=$readonly_scope
     while [ "$#" -gt 0 ]; do
         case $1 in
+            --copy-tree) authorization_scope=$copy_tree_scope; shift ;;
             --no-open) no_open=yes; shift ;;
             --timeout)
                 [ "$#" -ge 2 ] || fail '--timeout needs seconds'
