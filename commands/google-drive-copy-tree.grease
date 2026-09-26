@@ -261,9 +261,9 @@ source_mime=$(jq -r '.mimeType // empty' "$source_response")
 [ "$source_mime" = "$folder_mime" ] ||
     fail "source is not a Drive folder: $source_id"
 
-source_can_list=$(jq -r '.capabilities.canListChildren // true' "$source_response")
-[ "$source_can_list" = true ] ||
+if jq -e '.capabilities.canListChildren == false' "$source_response" >/dev/null; then
     fail "source folder cannot be listed by this account: $source_id"
+fi
 
 source_name=$(jq -er '.name' "$source_response")
 source_drive_id=$(jq -r '.driveId // empty' "$source_response")
@@ -360,19 +360,21 @@ while :; do
         child_mime=$(printf '%s\n' "$child_json" | jq -er '.mimeType')
 
         if [ "$child_mime" = "$folder_mime" ]; then
-            child_can_list=$(printf '%s\n' "$child_json" |
-                jq -r '.capabilities.canListChildren // true')
-            [ "$child_can_list" = true ] ||
+            if printf '%s\n' "$child_json" |
+                jq -e '.capabilities.canListChildren == false' >/dev/null
+            then
                 fail "source subfolder cannot be listed by this account: $child_id"
+            fi
 
             create_folder_copy "$child_id" "$child_name" "$queue_destination_id"
             child_destination_id=$result_id
             printf '%s\t%s\n' "$child_id" "$child_destination_id" >> "$queue"
         else
-            child_can_copy=$(printf '%s\n' "$child_json" |
-                jq -r '.capabilities.canCopy // true')
-            [ "$child_can_copy" = true ] ||
+            if printf '%s\n' "$child_json" |
+                jq -e '.capabilities.canCopy == false' >/dev/null
+            then
                 fail "source object cannot be copied by this account: $child_id ($child_name)"
+            fi
 
             copy_file_object "$child_id" "$child_name" "$child_mime" "$queue_destination_id"
         fi
