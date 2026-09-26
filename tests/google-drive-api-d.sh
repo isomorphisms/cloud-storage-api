@@ -13,14 +13,25 @@ trap cleanup EXIT HUP INT TERM
 
 port_file=$temporary/port
 log_file=$temporary/requests.ndjson
+server_stderr=$temporary/server.stderr
 : > "$log_file"
-node "$root/tests/google-drive-api-d-server.mjs" "$port_file" "$log_file" &
+: > "$server_stderr"
+node "$root/tests/google-drive-api-d-server.mjs" "$port_file" "$log_file" 2>"$server_stderr" &
 server_pid=$!
 
 attempt=0
 while [ ! -s "$port_file" ]; do
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+        printf '%s\n' 'fake Drive server exited before listening:' >&2
+        cat "$server_stderr" >&2
+        exit 1
+    fi
     attempt=$((attempt + 1))
-    [ "$attempt" -lt 100 ] || { printf '%s\n' 'fake Drive server did not start' >&2; exit 1; }
+    if [ "$attempt" -ge 100 ]; then
+        printf '%s\n' 'fake Drive server did not start' >&2
+        cat "$server_stderr" >&2
+        exit 1
+    fi
     sleep 0.05
 done
 port=$(cat "$port_file")
