@@ -111,7 +111,15 @@ google-drive-auth complete \
 Google blocks OAuth authorization pages in embedded WebViews. The phone path
 therefore does not send the Google authorization endpoint to IB's WebView.
 Instead, IB invokes Google Identity Services and returns only the one-time
-server authorization code to this command over IPv4 loopback.
+server authorization code through a narrow result-handoff boundary.
+
+The OAuth state machine does not own the handoff transport. The current
+`google-drive-authorization-handoff.grease` adapter still uses the existing
+random IPv4 loopback receiver underneath, but it publishes that as one
+non-secret control name/value. A later Binder/ParcelFileDescriptor,
+ContentProvider, Unix-domain-socket, or other phone adapter can replace that
+lowering without changing pending OAuth state, Google Identity Services, token
+exchange, or durable credential storage.
 
 In the same Google Cloud project, configure:
 
@@ -136,19 +144,58 @@ google-drive-auth authorize-android \
   /explicit/private/path/google-drive.credentials
 ```
 
-`authorize-android` binds the existing one-shot loopback receiver on a random
-`127.0.0.1` port and creates a fresh state value. On Termux it sends an
-`ib://google-drive-authorize?...` control URI directly to IB with
-`termux-open-url`; if that helper is unavailable, it prints the control URI.
-The URI contains only the Web client ID, requested read-only scope, state, and
-loopback port. It contains no client secret, authorization code, refresh token,
-or bearer token.
+`authorize-android` creates fresh durable pending state, starts the configured
+result-handoff adapter, and waits for a private result. The adapter publishes a
+small offer:
+
+```text
+schema=google-drive-authorization-handoff-v1
+adapter=<adapter name>
+control_name=<one non-secret query field>
+control_value=<one non-secret value>
+```
+
+The OAuth command validates that offer and adds the control name/value to the
+private `ib://google-drive-authorize?...` URI. It does not interpret the value
+as a TCP port. The current loopback adapter happens to publish
+`control_name=port`; that is adapter vocabulary rather than OAuth vocabulary.
+
+The private result returned by every adapter carries the pending OAuth state
+alongside exactly one result:
+
+```text
+state=<same state from the pending authorization>
+code=<one-time server authorization code>
+```
+
+or:
+
+```text
+state=<same state from the pending authorization>
+error=<bounded provider error>
+```
+
+`google-drive-auth` validates that state itself before exchanging a code. A
+transport may validate state earlier as defense in depth, as the loopback helper
+does, but transport-specific validation is not allowed to become the only OAuth
+state check.
+
+On Termux the command sends the control URI directly to IB with
+`termux-open-url`; if that helper is unavailable, it prints the URI. The URI
+contains only the Web client ID, requested read-only scope, state, and the
+adapter's non-secret control field. It contains no client secret, authorization
+code, refresh token, or bearer token.
 
 IB must accept only the exact Drive read-only scope, obtain a server auth code
-through Google Identity Services, and return it to the supplied loopback port
-with the same state. The shell exchanges that code using the imported Web
-client, requires a refresh token and the Drive read-only scope, then writes the
-same mode-0600 credential format used by the Desktop flow.
+through Google Identity Services, and return it through the offered handoff with
+the same state. The shell exchanges that code using the imported Web client,
+requires a refresh token and the Drive read-only scope, then writes the same
+mode-0600 credential format used by the Desktop flow.
+
+The adapter is selected with `GOOGLE_DRIVE_AUTHORIZATION_HANDOFF` when an
+explicit Grease program is being tested. The default is the sibling
+`google-drive-authorization-handoff.grease`. `GOOGLE_OAUTH_LOOPBACK` remains
+the low-level helper used by that default adapter and by the Desktop flow.
 
 The Android flow is deliberately separate from the Desktop PKCE path above.
 It does not make successful Android authorization evidence a claim about the

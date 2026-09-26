@@ -11,6 +11,18 @@ elif [ -x "$script_directory/google-oauth-loopback" ]; then
 else
     loopback_helper=google-oauth-loopback
 fi
+
+if [ -n "${GOOGLE_DRIVE_AUTHORIZATION_HANDOFF:-}" ]; then
+    authorization_handoff_program=$GOOGLE_DRIVE_AUTHORIZATION_HANDOFF
+elif [ -f "$script_directory/google-drive-authorization-handoff.grease" ]; then
+    authorization_handoff_program=$script_directory/google-drive-authorization-handoff.grease
+elif command -v google-drive-authorization-handoff.grease >/dev/null 2>&1; then
+    authorization_handoff_program=$(command -v google-drive-authorization-handoff.grease)
+else
+    authorization_handoff_program=google-drive-authorization-handoff.grease
+fi
+grease_runner=${GREASE:-grease}
+
 readonly_scope=https://www.googleapis.com/auth/drive.readonly
 authorization_endpoint=https://accounts.google.com/o/oauth2/v2/auth
 token_endpoint=https://oauth2.googleapis.com/token
@@ -65,8 +77,13 @@ curl-config writes a private curl configuration containing a current bearer
 token. It refreshes automatically before expiry and never prints a token.
 
 Environment:
+  GOOGLE_DRIVE_AUTHORIZATION_HANDOFF
+      Explicit path to the Grease result-handoff adapter used by authorize-android.
+      The default adapter is google-drive-authorization-handoff.grease.
+
   GOOGLE_OAUTH_LOOPBACK
-      Explicit path to the compiled google-oauth-loopback helper.
+      Explicit path to the compiled google-oauth-loopback helper used by the
+      Desktop flow and by the current default Android handoff adapter.
 USAGE
 }
 
@@ -374,6 +391,11 @@ exchange_android_result() {
     pending_file=$(pending_path "$credential_file")
     validate_private_file "$pending_file" 'OAuth pending file'
     validate_private_file "$result_file" 'OAuth callback result'
+    expected_state=$(require_field state "$pending_file")
+    returned_state=$(require_field state "$result_file")
+    [ "$returned_state" = "$expected_state" ] ||
+        runtime_fail 'Android authorization state did not match the pending request'
+
     callback_error=$(read_field error "$result_file")
     if [ -n "$callback_error" ]; then
         case $callback_error in *[!A-Za-z0-9._-]*) callback_error=authorization_error ;; esac
@@ -703,44 +725,63 @@ command_authorize_android() {
     credential_values
     [ "$client_type" = android-web ] ||
         fail 'authorize-android requires a Web application OAuth client imported by init-android'
-    need_command "$loopback_helper"
-    need_command openssl
+    need_command "$grease_runner"
+    [ -f "$authorization_handoff_program" ] ||
+        fail "Android authorization handoff program not found: $authorization_handoff_program"
     write_android_pending
 
     temporary_root=${TMPDIR:-/tmp}
-    listener_temporary=$(mktemp -d "$temporary_root/cloud-storage-oauth-android-listener.XXXXXX")
-    port_file=$listener_temporary/port
-    result_file=$listener_temporary/result
-    "$loopback_helper" listen "$(pending_path "$credential_file")" \
-        "$port_file" "$result_file" "$callback_timeout" &
-    listener_pid=$!
-    listener_cleanup() {
-        kill "$listener_pid" >/dev/null 2>&1 || :
-        wait "$listener_pid" >/dev/null 2>&1 || :
-        rm -rf -- "$listener_temporary"
+    handoff_temporary=$(mktemp -d "$temporary_root/cloud-storage-oauth-android-handoff.XXXXXX")
+    offer_file=$handoff_temporary/offer
+    result_file=$handoff_temporary/result
+
+    "$grease_runner" "$authorization_handoff_program" listen \
+        "$(pending_path "$credential_file")" \
+        "$offer_file" \
+        "$result_file" \
+        "$callback_timeout" &
+    handoff_pid=$!
+
+    handoff_cleanup() {
+        kill "$handoff_pid" >/dev/null 2>&1 || :
+        wait "$handoff_pid" >/dev/null 2>&1 || :
+        rm -rf -- "$handoff_temporary"
     }
-    trap listener_cleanup EXIT HUP INT TERM
+    trap handoff_cleanup EXIT HUP INT TERM
 
     ready_attempt=0
-    while [ ! -f "$port_file" ] && [ "$ready_attempt" -lt 10 ]; do
-        if ! kill -0 "$listener_pid" >/dev/null 2>&1; then
-            wait "$listener_pid" || :
-            fail 'OAuth loopback listener failed before opening a port'
+    while [ ! -f "$offer_file" ] && [ "$ready_attempt" -lt 10 ]; do
+        if ! kill -0 "$handoff_pid" >/dev/null 2>&1; then
+            wait "$handoff_pid" || :
+            fail 'Android authorization handoff failed before publishing an offer'
         fi
         sleep 1
         ready_attempt=$((ready_attempt + 1))
     done
-    [ -f "$port_file" ] || fail 'OAuth loopback listener did not report a port'
-    loopback_port=$(sed -n '1p' "$port_file")
-    validate_number 'loopback port' "$loopback_port"
-    [ "${#loopback_port}" -le 5 ] || fail 'OAuth loopback listener returned an invalid port'
-    [ "$loopback_port" -ge 1 ] && [ "$loopback_port" -le 65535 ] ||
-        fail 'OAuth loopback listener returned an invalid port'
+    [ -f "$offer_file" ] || fail 'Android authorization handoff did not publish an offer'
+
+    validate_private_file "$offer_file" 'authorization handoff offer'
+    handoff_schema=$(require_field schema "$offer_file")
+    [ "$handoff_schema" = google-drive-authorization-handoff-v1 ] ||
+        fail "unsupported authorization handoff offer: $handoff_schema"
+    handoff_adapter=$(require_field adapter "$offer_file")
+    control_name=$(require_field control_name "$offer_file")
+    control_value=$(require_field control_value "$offer_file")
+    validate_opaque_value handoff_adapter "$handoff_adapter"
+    case $control_name in
+        ''|*[!A-Za-z0-9._~-]*)
+            fail 'authorization handoff control name contains unsupported bytes'
+            ;;
+        client_id|scope|state)
+            fail "authorization handoff attempted to override reserved control field: $control_name"
+            ;;
+    esac
+    validate_opaque_value handoff_control "$control_value"
 
     pending_file=$(pending_path "$credential_file")
     state=$(require_field state "$pending_file")
     requested_scope=$(require_field scope "$pending_file")
-    control_uri="ib://google-drive-authorize?client_id=$(encode_url_component "$client_id")&scope=$(encode_url_component "$requested_scope")&state=$(encode_url_component "$state")&port=$loopback_port"
+    control_uri="ib://google-drive-authorize?client_id=$(encode_url_component "$client_id")&scope=$(encode_url_component "$requested_scope")&state=$(encode_url_component "$state")&$(encode_url_component "$control_name")=$(encode_url_component "$control_value")"
 
     opened=no
     if [ "$no_open" != yes ] && command -v termux-open-url >/dev/null 2>&1; then
@@ -752,11 +793,15 @@ command_authorize_android() {
         printf '%s\n' 'Open this private handoff URI in IB on the same device:' >&2
         printf '%s\n' "$control_uri"
     fi
-    printf '%s\n' 'Waiting for the private loopback authorization code...' >&2
-    wait "$listener_pid" || runtime_fail 'Android Google authorization did not complete'
+    printf 'authorization_handoff_adapter=%s\n' "$handoff_adapter" >&2
+    printf '%s\n' 'Waiting for the private authorization result...' >&2
+
+    wait "$handoff_pid" ||
+        runtime_fail 'Android Google authorization handoff did not complete'
     exchange_android_result "$result_file"
+
     trap - EXIT HUP INT TERM
-    rm -rf -- "$listener_temporary"
+    rm -rf -- "$handoff_temporary"
 }
 
 command_complete() {

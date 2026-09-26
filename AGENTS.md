@@ -121,9 +121,18 @@ Whenever giving the human a script or command block, assume `$PWD` is arbitrary.
 - Do not broaden to full-Drive access merely to avoid designing a narrower flow.
 - Do not embed reusable user credentials or shared secrets in binaries.
 - Keep authentication architecture separate from the storage object model so it can change without rewriting object identity.
-- The repository-owned read path uses the documented desktop installed-app flow
+- The repository-owned Desktop read path uses the documented installed-app flow
   with PKCE, state validation, and a random IPv4 loopback port. Do not restore
   the removed out-of-band flow or put authorization codes in process arguments.
+- Android authorization has a separate result-handoff boundary. The
+  `authorize-android` state machine may ask a handoff adapter for one non-secret
+  control name/value and then waits for a private result file. The OAuth state
+  machine must not know that the current adapter happens to lower this to a
+  `127.0.0.1` listener.
+- `google-drive-authorization-handoff.grease` is currently the loopback
+  lowering and is provisional evidence, not the definition of Android IPC.
+  Preserve it as a fallback/control while IB physical experiments establish a
+  better phone mechanism.
 - `drive.readonly` is the current least-privileged scope that can locate and
   read an existing Takeout object. `drive.file` is not a substitute for objects
   the application did not create or open. This read credential is not evidence

@@ -255,6 +255,76 @@ for secret in GOCSPX-ANDROID_WEB_SECRET ANDROID_SERVER_AUTH_CODE; do
         exit 1
     fi
 done
+
+fake_handoff=$temporary/fake-authorization-handoff.grease
+cat > "$fake_handoff" <<'EOF_FAKE_HANDOFF'
+set -eu
+[ "${1:-}" = listen ] || exit 64
+shift
+[ "$#" -eq 4 ] || exit 64
+pending_file=$1
+offer_file=$2
+result_file=$3
+timeout_seconds=$4
+case $timeout_seconds in ''|*[!0-9]*) exit 64 ;; esac
+state=$(sed -n 's/^state=//p' "$pending_file")
+[ -n "$state" ] || exit 65
+umask 077
+cat > "$offer_file" <<'EOF_OFFER'
+schema=google-drive-authorization-handoff-v1
+adapter=fake
+control_name=reply
+control_value=fake-result
+EOF_OFFER
+chmod 600 "$offer_file"
+{
+    printf '%s\n' 'code=ADAPTER_SERVER_AUTH_CODE'
+    if [ "${FAKE_HANDOFF_WRONG_STATE:-0}" = 1 ]; then
+        printf '%s\n' 'state=WRONG_ADAPTER_STATE'
+    else
+        printf 'state=%s\n' "$state"
+    fi
+} > "$result_file"
+chmod 600 "$result_file"
+EOF_FAKE_HANDOFF
+chmod 600 "$fake_handoff"
+
+adapter_credential=$temporary/config/google-drive-android-adapter.credentials
+common_env init-android "$android_client_json" "$adapter_credential" >/dev/null
+export GOOGLE_DRIVE_AUTHORIZATION_HANDOFF=$fake_handoff
+adapter_stdout=$temporary/adapter-authorize.stdout
+adapter_stderr=$temporary/adapter-authorize.stderr
+common_env authorize-android "$adapter_credential" --no-open --timeout 20 \
+    >"$adapter_stdout" 2>"$adapter_stderr"
+unset GOOGLE_DRIVE_AUTHORIZATION_HANDOFF
+grep -F 'ib://google-drive-authorize?' "$adapter_stdout" >/dev/null
+grep -F '&reply=fake-result' "$adapter_stdout" >/dev/null
+if grep -F '&port=' "$adapter_stdout" >/dev/null; then
+    printf '%s\n' 'semantic handoff test unexpectedly required a loopback port' >&2
+    exit 1
+fi
+grep -F 'authorization_handoff_adapter=fake' "$adapter_stderr" >/dev/null
+grep -F 'refresh_token=REFRESH_LONG_LIVED' "$adapter_credential" >/dev/null
+grep -F 'access_token=ACCESS_INITIAL' "$adapter_credential" >/dev/null
+adapter_form=$(tail -n 1 "$form_log")
+printf '%s\n' "$adapter_form" | grep -F 'code=ADAPTER_SERVER_AUTH_CODE' >/dev/null
+
+wrong_adapter_credential=$temporary/config/google-drive-android-wrong-adapter.credentials
+common_env init-android "$android_client_json" "$wrong_adapter_credential" >/dev/null
+export GOOGLE_DRIVE_AUTHORIZATION_HANDOFF=$fake_handoff
+export FAKE_HANDOFF_WRONG_STATE=1
+if common_env authorize-android "$wrong_adapter_credential" --no-open --timeout 20 \
+    >"$temporary/wrong-adapter.stdout" 2>"$temporary/wrong-adapter.stderr"
+then
+    printf '%s\n' 'wrong-state Android handoff unexpectedly succeeded' >&2
+    exit 1
+fi
+unset FAKE_HANDOFF_WRONG_STATE
+unset GOOGLE_DRIVE_AUTHORIZATION_HANDOFF
+grep -F 'Android authorization state did not match the pending request' \
+    "$temporary/wrong-adapter.stderr" >/dev/null
+[ -f "$wrong_adapter_credential.pending" ]
+
 loop_pending=$temporary/loop.pending
 loop_port=$temporary/loop.port
 loop_result=$temporary/loop.result
@@ -279,4 +349,4 @@ if common_env status "$credential" >/dev/null 2>"$temporary/mode.err"; then
 fi
 grep -F 'must not be accessible by group or other users' "$temporary/mode.err" >/dev/null
 
-printf '%s\n' 'Google Drive OAuth PKCE, private storage, refresh, revocation, scope, and loopback contracts pass'
+printf '%s\n' 'Google Drive OAuth PKCE, private storage, refresh, revocation, scope, semantic Android handoff, and loopback adapter contracts pass'
