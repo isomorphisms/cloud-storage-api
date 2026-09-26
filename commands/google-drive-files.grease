@@ -3,6 +3,7 @@ set -eu
 
 script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 api_command=$script_directory/google-drive-api.grease
+copy_tree_command=$script_directory/google-drive-copy-tree.grease
 
 usage() {
     cat <<'EOF'
@@ -11,6 +12,7 @@ usage:
   google-drive-files get FILE
   google-drive-files download FILE
   google-drive-files export FILE MIME_TYPE
+  google-drive-files copy-tree SOURCE_FOLDER DESTINATION_PARENT [--name NAME]
 
 Convenience commands over the complete google-drive-api Grease surface.
 
@@ -27,6 +29,9 @@ list/get include thumbnail metadata needed by local viewers:
 download writes a one-shot stored-byte response to stdout. For a large,
 restartable transfer to an explicit path, use:
   google-drive-download FILE DESTINATION
+
+copy-tree recreates a folder tree with server-side Drive copies. It is
+restartable and requires a write-capable credential; see google-drive-copy-tree.
 EOF
 }
 
@@ -63,6 +68,14 @@ run_api() {
         "$GREASE" "$api_command" "$@"
     else
         "$api_command" "$@"
+    fi
+}
+
+run_copy_tree() {
+    if [ -n "${GREASE:-}" ]; then
+        "$GREASE" "$copy_tree_command" "$@"
+    else
+        "$copy_tree_command" "$@"
     fi
 }
 
@@ -195,6 +208,9 @@ case $action in
         ;;
     export)
         export_file "$@"
+        ;;
+    copy-tree)
+        run_copy_tree "$@"
         ;;
     *)
         printf 'unknown action: %s\n' "$action" >&2

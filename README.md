@@ -58,11 +58,13 @@ large body as an ordinary request.
 
 `commands/google-drive-auth.grease` implements the installed-application OAuth
 flow with PKCE, state validation, a random loopback callback port, private
-refresh-token storage, expiry handling, and automatic refresh. It requests the
-read-only Drive scope needed to discover and download an already-existing
-Takeout object. Set `GOOGLE_DRIVE_CREDENTIAL_FILE` to that private credential;
-ordinary API, download, and ZIP-range requests no longer require a manually
-copied hourly access token. Explicit `GOOGLE_ACCESS_TOKEN` and
+refresh-token storage, expiry handling, and automatic refresh. Authorization is
+read-only by default. `authorize`, `authorize-android`, and `begin` accept
+`--copy-tree` to request `drive.readonly + drive.file` for server-side archive
+copies without requesting the broad `drive` scope. Set
+`GOOGLE_DRIVE_CREDENTIAL_FILE` to that private credential; ordinary API,
+download, ZIP-range, and copy-tree requests no longer require a manually copied
+hourly access token. Explicit `GOOGLE_ACCESS_TOKEN` and
 `GOOGLE_ACCESS_TOKEN_FILE` remain lower-level fallbacks.
 
 The Android authorization path uses the same durable credential and token
@@ -78,16 +80,33 @@ Tokens are placed in a private curl config rather than curl argv.
 the one-time authorization and exact command path.
 
 `commands/google-drive-files.grease` is the smaller convenience layer for the
-reader-oriented operations already in use:
+operations already in use:
 
 - `list` / search metadata;
 - `get` metadata by opaque file ID;
 - `download` stored bytes through `files.get?alt=media`;
-- `export` Google Workspace-native content to an explicit MIME type.
+- `export` Google Workspace-native content to an explicit MIME type;
+- `copy-tree` make an independent recursive server-side folder copy.
 
 Its list/get projection includes `hasThumbnail`, `thumbnailLink`,
 `thumbnailVersion`, image metadata, and video metadata so a viewer can maintain
 a local thumbnail cache without making those links part of durable identity.
+
+`commands/google-drive-copy-tree.grease` recreates the source folder hierarchy
+under a destination parent and uses Drive `files.copy`, so file bytes do not
+round-trip through the phone or shell host. Private `appProperties` bind each
+created object to its source ID, source root, role, and (for files) source
+version. A rerun reconciles those markers and reuses completed work. The NDJSON
+summary is successful only when every discovered source object has a matching
+created or reused destination object and no copy failures occurred. Binary files
+with source SHA-256/size metadata are checked against the copy response.
+
+The copy is a current-state archive, not a complete Drive clone: source
+permissions and revision history are not reproduced. Open Docs/Sheets/Slides
+comments are requested with `copyComments=true`. Drive shortcuts fail closed
+instead of creating a new shortcut that would remain dependent on the original
+target. The deterministic CI contract uses a fake Drive transport; it is not a
+live write-authorization or live Drive-copy receipt.
 
 `commands/google-drive-download.grease` is the restartable stored-byte path for
 large blobs. It takes an opaque Drive file ID and an explicit local destination,

@@ -8,11 +8,14 @@ on:
       - commands/google-drive-api.grease
       - commands/google-drive-auth.grease
       - commands/google-drive-authorization-handoff.grease
+      - commands/google-drive-copy-tree.grease
       - commands/google-drive-download.grease
+      - commands/google-drive-files.grease
       - commands/google-drive-download-state.c
       - commands/google-oauth-loopback.c
       - docs/google-drive-auth-download.md
       - tests/google-drive-auth.sh
+      - tests/google-drive-copy-tree.sh
       - tests/google-drive-download.sh
       - tests/live-takeout-extract.sh
       - tests/live-find-chatgpt-export.sh
@@ -25,11 +28,14 @@ on:
       - commands/google-drive-api.grease
       - commands/google-drive-auth.grease
       - commands/google-drive-authorization-handoff.grease
+      - commands/google-drive-copy-tree.grease
       - commands/google-drive-download.grease
+      - commands/google-drive-files.grease
       - commands/google-drive-download-state.c
       - commands/google-oauth-loopback.c
       - docs/google-drive-auth-download.md
       - tests/google-drive-auth.sh
+      - tests/google-drive-copy-tree.sh
       - tests/google-drive-download.sh
       - tests/live-takeout-extract.sh
       - tests/live-find-chatgpt-export.sh
@@ -109,13 +115,14 @@ jobs:
           export GOOGLE_OAUTH_LOOPBACK="$PWD/_/test-bin/google-oauth-loopback"
           export GOOGLE_DRIVE_DOWNLOAD_STATE="$PWD/_/test-bin/google-drive-download-state"
           sh tests/google-drive-auth.sh
+          sh tests/google-drive-copy-tree.sh
           sh tests/google-drive-download.sh
 
       - name: State evidence boundary
         shell: sh
         run: |
           printf '%s\n' \
-            'PASS: exact pinned Grease with fake OAuth/Drive transports and deterministic local durability/range corruption cases; not live Google authorization, authenticated Drive, Takeout, or physical Android evidence.'
+            'PASS: exact pinned Grease with fake OAuth/Drive transports and deterministic copy-tree/restartable-download contracts; not live write authorization, live Drive copy, Takeout, or physical Android evidence.'
 
 
   live-drive-probe:
