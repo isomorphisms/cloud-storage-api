@@ -1,0 +1,582 @@
+#!/usr/bin/env grease
+set -eu
+LC_ALL=C
+export LC_ALL
+
+script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+api_command=$script_directory/google-drive-api.grease
+auth_command=${GOOGLE_DRIVE_AUTH:-$script_directory/google-drive-auth.grease}
+if [ -n "${GOOGLE_DRIVE_DOWNLOAD_STATE:-}" ]; then
+    transfer_helper=$GOOGLE_DRIVE_DOWNLOAD_STATE
+elif [ -x "$script_directory/google-drive-download-state" ]; then
+    transfer_helper=$script_directory/google-drive-download-state
+else
+    transfer_helper=google-drive-download-state
+fi
+
+usage() {
+    cat <<'USAGE'
+usage:
+  google-drive-download FILE DESTINATION [OPTIONS]
+
+Download the stored bytes of one opaque Google Drive file ID to an explicit
+local destination. The command inspects metadata first, writes bounded ranges
+progressively, and resumes only when the sidecar state and partial file agree.
+
+FILE may be a raw Drive file ID or an ordinary Drive URL. DESTINATION is never
+inferred and may be on removable storage.
+
+Options:
+  --create-parent
+      Deliberately create a missing destination parent directory.
+
+  --chunk-size BYTES
+      Range size from 1 through 268435456. Default: 67108864 (64 MiB).
+
+  --state-file FILE
+      Small durable transfer state. Default: DESTINATION.google-drive.state
+
+  --receipt-file FILE
+      Final NDJSON receipt. Default: DESTINATION.google-drive.receipt.ndjson
+
+Environment:
+  GOOGLE_DRIVE_CREDENTIAL_FILE
+      Private google-drive-auth credential. Access tokens refresh before expiry
+      and once after an HTTP 401 during a multi-request transfer.
+
+  GOOGLE_ACCESS_TOKEN / GOOGLE_ACCESS_TOKEN_FILE
+      Explicit short-lived token fallback. These do not provide refresh.
+
+  GOOGLE_DRIVE_RESOURCE_KEYS
+      Optional X-Goog-Drive-Resource-Keys value.
+
+  GOOGLE_DRIVE_DOWNLOAD_STATE
+      Explicit path to the compiled google-drive-download-state helper.
+
+The multi-gigabyte partial and segment files are always adjacent to
+DESTINATION. They are never staged through TMPDIR, the checkout, or Termux
+internal storage. Recoverable failures retain the partial file and state.
+USAGE
+}
+
+fail() {
+    printf '%s\n' "$*" >&2
+    exit 2
+}
+
+runtime_fail() {
+    printf '%s\n' "$*" >&2
+    exit 1
+}
+
+need_command() {
+    command -v "$1" >/dev/null 2>&1 || {
+        printf 'google-drive-download needs %s\n' "$1" >&2
+        exit 127
+    }
+}
+
+require_bounded_curl() {
+    version=$(curl --version | sed -n '1s/^curl \([0-9][0-9.]*\).*/\1/p')
+    [ -n "$version" ] || fail 'cannot determine curl version'
+    major=${version%%.*}
+    remainder=${version#*.}
+    minor=${remainder%%.*}
+    case $major:$minor in
+        *[!0-9:]*|:*) fail "cannot parse curl version: $version" ;;
+    esac
+    if [ "$major" -lt 8 ] || { [ "$major" -eq 8 ] && [ "$minor" -lt 4 ]; }; then
+        fail "google-drive-download needs curl 8.4 or newer for a hard running-transfer size bound (found $version)"
+    fi
+}
+
+drive_id() {
+    value=$1
+    case $value in
+        *'/d/'*) value=${value#*/d/}; value=${value%%/*} ;;
+        *'/folders/'*) value=${value#*/folders/}; value=${value%%/*} ;;
+        *'id='*) value=${value#*id=}; value=${value%%&*} ;;
+    esac
+    value=${value%%\?*}
+    value=${value%%\#*}
+    [ -n "$value" ] || fail 'empty Google Drive id'
+    printf '%s\n' "$value"
+}
+
+run_api() {
+    if [ -n "${GREASE:-}" ]; then
+        "$GREASE" "$api_command" "$@"
+    else
+        "$api_command" "$@"
+    fi
+}
+
+run_auth() {
+    if [ -n "${GREASE:-}" ]; then
+        "$GREASE" "$auth_command" "$@"
+    else
+        "$auth_command" "$@"
+    fi
+}
+
+validate_decimal() {
+    decimal_name=$1
+    decimal_value=$2
+    case $decimal_value in
+        ''|*[!0-9]*) fail "$decimal_name is not an unsigned decimal integer" ;;
+    esac
+}
+
+validate_sidecar_value() {
+    sidecar_name=$1
+    sidecar_value=$2
+    case $sidecar_value in
+        *[!A-Za-z0-9._~+/:=-]*) fail "$sidecar_name contains unsupported bytes" ;;
+    esac
+}
+
+validate_private_state() {
+    [ -f "$state_file" ] || fail "download state is not a regular file: $state_file"
+    [ ! -L "$state_file" ] || fail "download state must not be a symbolic link: $state_file"
+    state_mode=$(stat -c %a -- "$state_file") || fail 'cannot inspect download-state permissions'
+    case $state_mode in
+        *00) ;;
+        *) fail "download state must not be accessible by group or other users: $state_file" ;;
+    esac
+}
+
+read_state_field() {
+    state_name=$1
+    state_count=$( { grep -c "^$state_name=" "$state_file" || :; } )
+    [ "$state_count" -le 1 ] || fail "download state repeats $state_name"
+    sed -n "s/^$state_name=//p" "$state_file"
+}
+
+required_state_field() {
+    state_required=$(read_state_field "$1")
+    [ -n "$state_required" ] || fail "download state has no $1"
+    printf '%s' "$state_required"
+}
+
+write_state() {
+    new_status=$1
+    new_complete=$2
+    new_local_sha256=${3:-}
+    state_directory=$(dirname -- "$state_file")
+    state_temporary=$(mktemp "$state_directory/.google-drive-state.XXXXXX")
+    umask 077
+    {
+        printf '%s\n' 'schema=google-drive-download-v1'
+        printf '%s\n' 'provider=google-drive'
+        printf 'file_id=%s\n' "$source_id"
+        printf 'expected_size=%s\n' "$source_size"
+        printf 'checksum_algorithm=%s\n' "$checksum_algorithm"
+        printf 'checksum_value=%s\n' "$checksum_value"
+        printf 'provider_version=%s\n' "$source_version"
+        printf 'modified_time=%s\n' "$source_modified_time"
+        printf 'chunk_size=%s\n' "$chunk_size"
+        printf 'bytes_complete=%s\n' "$new_complete"
+        printf 'status=%s\n' "$new_status"
+        if [ -n "$new_local_sha256" ]; then
+            printf 'local_sha256=%s\n' "$new_local_sha256"
+        fi
+    } > "$state_temporary"
+    chmod 600 "$state_temporary"
+    "$transfer_helper" commit "$state_temporary" "$state_file"
+}
+
+load_and_match_state() {
+    validate_private_state
+    [ "$(required_state_field schema)" = google-drive-download-v1 ] ||
+        fail 'download state has an unsupported schema'
+    [ "$(required_state_field provider)" = google-drive ] ||
+        fail 'download state belongs to another provider'
+    stored_id=$(required_state_field file_id)
+    stored_size=$(required_state_field expected_size)
+    stored_checksum_algorithm=$(read_state_field checksum_algorithm)
+    stored_checksum_value=$(read_state_field checksum_value)
+    stored_version=$(read_state_field provider_version)
+    stored_modified_time=$(read_state_field modified_time)
+    stored_chunk=$(required_state_field chunk_size)
+    bytes_complete=$(required_state_field bytes_complete)
+    transfer_status=$(required_state_field status)
+    stored_local_sha256=$(read_state_field local_sha256)
+    validate_decimal expected_size "$stored_size"
+    validate_decimal chunk_size "$stored_chunk"
+    validate_decimal bytes_complete "$bytes_complete"
+    [ "$stored_id" = "$source_id" ] || fail 'download state belongs to a different Drive file ID'
+    [ "$stored_size" = "$source_size" ] || fail 'remote Drive object size changed between attempts'
+    [ "$stored_checksum_algorithm" = "$checksum_algorithm" ] ||
+        fail 'remote Drive checksum kind changed between attempts'
+    [ "$stored_checksum_value" = "$checksum_value" ] ||
+        fail 'remote Drive checksum changed between attempts'
+    [ "$stored_version" = "$source_version" ] ||
+        fail 'remote Drive object version changed between attempts'
+    [ "$stored_modified_time" = "$source_modified_time" ] ||
+        fail 'remote Drive modification time changed between attempts'
+    [ "$stored_chunk" = "$chunk_size" ] ||
+        fail "download state uses chunk size $stored_chunk; resume with --chunk-size $stored_chunk"
+    case $transfer_status in partial|complete) ;; *) fail 'download state has an invalid status' ;; esac
+}
+
+hash_file() {
+    algorithm=$1
+    hash_path=$2
+    case $algorithm in
+        sha256) sha256sum -- "$hash_path" | awk '{print tolower($1)}' ;;
+        sha1) sha1sum -- "$hash_path" | awk '{print tolower($1)}' ;;
+        md5) md5sum -- "$hash_path" | awk '{print tolower($1)}' ;;
+        *) fail "unsupported checksum algorithm: $algorithm" ;;
+    esac
+}
+
+verify_complete_file() {
+    verify_path=$1
+    actual_size=$("$transfer_helper" size "$verify_path")
+    [ "$actual_size" = "$source_size" ] ||
+        runtime_fail "completed file length $actual_size does not match Drive size $source_size"
+    if [ -n "$checksum_algorithm" ]; then
+        actual_provider_checksum=$(hash_file "$checksum_algorithm" "$verify_path")
+        [ "$actual_provider_checksum" = "$checksum_value" ] ||
+            runtime_fail "completed file $checksum_algorithm checksum does not match Drive metadata"
+    fi
+    local_sha256=$(hash_file sha256 "$verify_path")
+}
+
+write_receipt() {
+    completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    receipt_directory=$(dirname -- "$receipt_file")
+    [ -d "$receipt_directory" ] || fail "receipt parent directory does not exist: $receipt_directory"
+    receipt_temporary=$(mktemp "$receipt_directory/.google-drive-receipt.XXXXXX")
+    umask 077
+    jq -cn \
+        --arg provider google-drive \
+        --arg file_id "$source_id" \
+        --arg name "$source_name" \
+        --arg size "$source_size" \
+        --arg mime_type "$source_mime" \
+        --arg provider_version "$source_version" \
+        --arg modified_time "$source_modified_time" \
+        --arg checksum_algorithm "$checksum_algorithm" \
+        --arg checksum_value "$checksum_value" \
+        --arg destination "$destination" \
+        --arg local_sha256 "$local_sha256" \
+        --arg completed_at "$completed_at" \
+        '{
+            kind: "stored-byte-download",
+            status: "complete",
+            provider: $provider,
+            file_id: $file_id,
+            name: $name,
+            size: ($size | tonumber),
+            mime_type: $mime_type,
+            provider_version: (if $provider_version == "" then null else $provider_version end),
+            modified_time: (if $modified_time == "" then null else $modified_time end),
+            provider_checksum: (if $checksum_algorithm == "" then null else {
+                algorithm: $checksum_algorithm,
+                value: $checksum_value
+            } end),
+            destination: $destination,
+            local_sha256: $local_sha256,
+            completed_at: $completed_at
+        }' > "$receipt_temporary"
+    chmod 600 "$receipt_temporary"
+    "$transfer_helper" commit "$receipt_temporary" "$receipt_file"
+}
+
+verify_remote_metadata_unchanged() {
+    current_metadata=$(run_api drive.files.get \
+        --path "fileId=$source_id" \
+        --query 'supportsAllDrives=true' \
+        --query 'fields=id,size,modifiedTime,version,md5Checksum,sha1Checksum,sha256Checksum,capabilities(canDownload)')
+    current_id=$(printf '%s' "$current_metadata" | jq -er '.id | strings | select(length > 0)') ||
+        runtime_fail 'final Drive metadata has no file id'
+    current_size=$(printf '%s' "$current_metadata" | jq -er '.size | strings | select(test("^[0-9]+$"))') ||
+        runtime_fail 'final Drive metadata has no stored-byte size'
+    current_version=$(printf '%s' "$current_metadata" | jq -r '.version // "" | if type == "string" then . elif type == "number" then tostring else "" end')
+    current_modified_time=$(printf '%s' "$current_metadata" | jq -r '.modifiedTime // "" | if type == "string" then . else "" end')
+    current_sha256=$(printf '%s' "$current_metadata" | jq -r '.sha256Checksum // "" | if type == "string" then ascii_downcase else "" end')
+    current_sha1=$(printf '%s' "$current_metadata" | jq -r '.sha1Checksum // "" | if type == "string" then ascii_downcase else "" end')
+    current_md5=$(printf '%s' "$current_metadata" | jq -r '.md5Checksum // "" | if type == "string" then ascii_downcase else "" end')
+    printf '%s' "$current_metadata" | jq -e '.capabilities.canDownload == true' >/dev/null ||
+        runtime_fail 'Drive metadata no longer permits download'
+    current_checksum_algorithm=
+    current_checksum_value=
+    if [ -n "$current_sha256" ]; then
+        current_checksum_algorithm=sha256; current_checksum_value=$current_sha256
+    elif [ -n "$current_sha1" ]; then
+        current_checksum_algorithm=sha1; current_checksum_value=$current_sha1
+    elif [ -n "$current_md5" ]; then
+        current_checksum_algorithm=md5; current_checksum_value=$current_md5
+    fi
+    [ "$current_id" = "$source_id" ] || runtime_fail 'remote Drive identity changed during download'
+    [ "$current_size" = "$source_size" ] || runtime_fail 'remote Drive object size changed during download'
+    [ "$current_version" = "$source_version" ] || runtime_fail 'remote Drive object version changed during download'
+    [ "$current_modified_time" = "$source_modified_time" ] || runtime_fail 'remote Drive modification time changed during download'
+    [ "$current_checksum_algorithm" = "$checksum_algorithm" ] &&
+        [ "$current_checksum_value" = "$checksum_value" ] ||
+        runtime_fail 'remote Drive checksum changed during download'
+}
+
+write_auth_config() {
+    refresh_mode=$1
+    token=${GOOGLE_ACCESS_TOKEN:-}
+    if [ -z "$token" ] && [ -n "${GOOGLE_ACCESS_TOKEN_FILE:-}" ]; then
+        token=$(cat -- "$GOOGLE_ACCESS_TOKEN_FILE")
+    fi
+    rm -f -- "$curl_config"
+    if [ -n "$token" ]; then
+        printf 'header = "Authorization: Bearer %s"\n' "$token" > "$curl_config"
+    else
+        credential_file=${GOOGLE_DRIVE_CREDENTIAL_FILE:-}
+        [ -n "$credential_file" ] ||
+            fail 'set GOOGLE_DRIVE_CREDENTIAL_FILE, GOOGLE_ACCESS_TOKEN, or GOOGLE_ACCESS_TOKEN_FILE'
+        if [ "$refresh_mode" = force ]; then
+            run_auth curl-config "$credential_file" "$curl_config" --force-refresh
+        else
+            run_auth curl-config "$credential_file" "$curl_config"
+        fi
+    fi
+    if [ -n "${GOOGLE_DRIVE_RESOURCE_KEYS:-}" ]; then
+        printf 'header = "X-Goog-Drive-Resource-Keys: %s"\n' \
+            "$GOOGLE_DRIVE_RESOURCE_KEYS" >> "$curl_config"
+    fi
+}
+
+fetch_segment_once() {
+    : > "$range_headers"
+    : > "$range_error"
+    : > "$segment_file"
+    curl \
+        --config "$curl_config" \
+        --fail \
+        --silent \
+        --show-error \
+        --request GET \
+        --header "Range: bytes=$range_start-$range_end" \
+        --dump-header "$range_headers" \
+        --max-filesize "$range_length" \
+        --output "$segment_file" \
+        "$download_url" 2>"$range_error"
+}
+
+fetch_segment() {
+    write_auth_config normal
+    if ! fetch_segment_once; then
+        range_status=$(awk '/^HTTP\/[0-9.]+ [0-9][0-9][0-9]/{status=$2} END{print status}' "$range_headers")
+        if [ "$range_status" = 401 ] && [ -n "${GOOGLE_DRIVE_CREDENTIAL_FILE:-}" ]; then
+            write_auth_config force
+            fetch_segment_once || {
+                retry_status=$(awk '/^HTTP\/[0-9.]+ [0-9][0-9][0-9]/{status=$2} END{print status}' "$range_headers")
+                runtime_fail "Drive range request failed after token refresh (HTTP ${retry_status:-unknown})"
+            }
+        else
+            case $range_status in
+                401) runtime_fail 'Drive rejected the explicit access token; obtain a fresh token or use GOOGLE_DRIVE_CREDENTIAL_FILE' ;;
+                403) runtime_fail 'Drive range request was forbidden; OAuth scope or file permissions may be insufficient' ;;
+                '') runtime_fail 'Drive range request failed before receiving an HTTP response' ;;
+                *) runtime_fail "Drive range request failed with HTTP $range_status" ;;
+            esac
+        fi
+    fi
+    grep -E '^HTTP/[0-9.]+ 206([[:space:]]|$)' "$range_headers" >/dev/null ||
+        runtime_fail "Drive ignored or rejected Range bytes=$range_start-$range_end; expected HTTP 206"
+    tr -d '\r' < "$range_headers" |
+        grep -Fxi "Content-Range: bytes $range_start-$range_end/$source_size" >/dev/null ||
+        runtime_fail "Drive returned the wrong Content-Range for bytes=$range_start-$range_end"
+    actual_segment_length=$("$transfer_helper" size "$segment_file")
+    [ "$actual_segment_length" = "$range_length" ] ||
+        runtime_fail "Drive range response length $actual_segment_length did not match $range_length"
+}
+
+case ${1:-} in
+    -h|--help|'') usage; exit 0 ;;
+esac
+[ "$#" -ge 2 ] || fail 'download needs FILE and DESTINATION'
+file_id=$(drive_id "$1")
+destination=$2
+shift 2
+[ -n "$destination" ] && [ "$destination" != - ] || fail 'DESTINATION must be an explicit local file path'
+
+create_parent=no
+chunk_size=67108864
+state_file=
+receipt_file=
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --create-parent) create_parent=yes; shift ;;
+        --chunk-size)
+            [ "$#" -ge 2 ] || fail '--chunk-size needs BYTES'
+            chunk_size=$2
+            shift 2
+            ;;
+        --state-file)
+            [ "$#" -ge 2 ] || fail '--state-file needs FILE'
+            state_file=$2
+            shift 2
+            ;;
+        --receipt-file)
+            [ "$#" -ge 2 ] || fail '--receipt-file needs FILE'
+            receipt_file=$2
+            shift 2
+            ;;
+        -h|--help) usage; exit 0 ;;
+        *) fail "unknown option: $1" ;;
+    esac
+done
+validate_decimal chunk_size "$chunk_size"
+[ "$chunk_size" -ge 1 ] && [ "$chunk_size" -le 268435456 ] ||
+    fail 'chunk size must be between 1 and 268435456 bytes'
+
+destination_directory=$(dirname -- "$destination")
+destination_name=$(basename -- "$destination")
+if [ ! -d "$destination_directory" ]; then
+    [ "$create_parent" = yes ] ||
+        fail "destination parent directory does not exist; pass --create-parent: $destination_directory"
+    mkdir -p -- "$destination_directory"
+fi
+[ -d "$destination_directory" ] || fail "destination parent is not a directory: $destination_directory"
+partial_file=$destination.google-drive.partial
+if [ -z "$state_file" ]; then state_file=$destination.google-drive.state; fi
+if [ -z "$receipt_file" ]; then receipt_file=$destination.google-drive.receipt.ndjson; fi
+[ "$state_file" != "$destination" ] && [ "$state_file" != "$partial_file" ] ||
+    fail 'state file conflicts with payload paths'
+[ "$receipt_file" != "$destination" ] && [ "$receipt_file" != "$partial_file" ] && [ "$receipt_file" != "$state_file" ] ||
+    fail 'receipt file conflicts with payload or state paths'
+state_directory=$(dirname -- "$state_file")
+[ -d "$state_directory" ] || fail "state parent directory does not exist: $state_directory"
+[ ! -L "$state_file" ] || fail "download state must not be a symbolic link: $state_file"
+[ ! -L "$receipt_file" ] || fail "download receipt must not be a symbolic link: $receipt_file"
+
+need_command curl
+need_command jq
+need_command stat
+need_command "$transfer_helper"
+need_command sha256sum
+require_bounded_curl
+
+metadata=$(run_api drive.files.get \
+    --path "fileId=$file_id" \
+    --query 'supportsAllDrives=true' \
+    --query 'fields=id,name,size,mimeType,modifiedTime,version,md5Checksum,sha1Checksum,sha256Checksum,capabilities(canDownload)')
+source_id=$(printf '%s' "$metadata" | jq -er '.id | strings | select(length > 0)') ||
+    fail 'Drive metadata has no file id'
+source_name=$(printf '%s' "$metadata" | jq -er '.name | strings') ||
+    fail 'Drive metadata has no file name'
+source_size=$(printf '%s' "$metadata" | jq -er '.size | strings | select(test("^[0-9]+$"))') ||
+    fail 'Drive metadata has no stored-byte size'
+source_mime=$(printf '%s' "$metadata" | jq -r '.mimeType // "" | if type == "string" then . else "" end')
+source_version=$(printf '%s' "$metadata" | jq -r '.version // "" | if type == "string" then . elif type == "number" then tostring else "" end')
+source_modified_time=$(printf '%s' "$metadata" | jq -r '.modifiedTime // "" | if type == "string" then . else "" end')
+source_sha256=$(printf '%s' "$metadata" | jq -r '.sha256Checksum // "" | if type == "string" then ascii_downcase else "" end')
+source_sha1=$(printf '%s' "$metadata" | jq -r '.sha1Checksum // "" | if type == "string" then ascii_downcase else "" end')
+source_md5=$(printf '%s' "$metadata" | jq -r '.md5Checksum // "" | if type == "string" then ascii_downcase else "" end')
+printf '%s' "$metadata" | jq -e '.capabilities.canDownload == true' >/dev/null ||
+    fail 'Drive metadata says this file cannot be downloaded'
+[ "$source_id" = "$file_id" ] || fail 'Drive metadata id does not match requested file id'
+case $source_id in *[!A-Za-z0-9_-]*) fail 'Drive file id contains unsupported URL-path bytes' ;; esac
+validate_decimal source_size "$source_size"
+validate_sidecar_value file_id "$source_id"
+validate_sidecar_value provider_version "$source_version"
+validate_sidecar_value modified_time "$source_modified_time"
+
+checksum_algorithm=
+checksum_value=
+if [ -n "$source_sha256" ]; then
+    checksum_algorithm=sha256; checksum_value=$source_sha256; expected_checksum_length=64
+elif [ -n "$source_sha1" ]; then
+    checksum_algorithm=sha1; checksum_value=$source_sha1; expected_checksum_length=40
+elif [ -n "$source_md5" ]; then
+    checksum_algorithm=md5; checksum_value=$source_md5; expected_checksum_length=32
+fi
+if [ -n "$checksum_algorithm" ]; then
+    case $checksum_value in *[!0-9a-f]*) fail "Drive $checksum_algorithm checksum is not hexadecimal" ;; esac
+    [ "${#checksum_value}" -eq "$expected_checksum_length" ] ||
+        fail "Drive $checksum_algorithm checksum has the wrong length"
+    need_command "${checksum_algorithm}sum"
+fi
+
+download_url="https://www.googleapis.com/drive/v3/files/$source_id?alt=media&supportsAllDrives=true"
+temporary_root=${TMPDIR:-/tmp}
+small_temporary=$(mktemp -d "$temporary_root/cloud-storage-drive-download.XXXXXX")
+curl_config=$small_temporary/curl.conf
+range_headers=$small_temporary/range.headers
+range_error=$small_temporary/range.stderr
+segment_file=$(mktemp "$destination_directory/.${destination_name}.google-drive-segment.XXXXXX")
+cleanup() {
+    rm -f -- "$segment_file"
+    rm -rf -- "$small_temporary"
+}
+trap cleanup EXIT HUP INT TERM
+umask 077
+
+if [ -e "$destination" ] || [ -L "$destination" ]; then
+    [ -f "$state_file" ] || fail "destination exists without matching download state: $destination"
+    [ ! -e "$partial_file" ] && [ ! -L "$partial_file" ] ||
+        fail 'destination and partial file both exist; refusing ambiguous recovery'
+    load_and_match_state
+    if [ "$transfer_status" != complete ] && [ -z "$checksum_algorithm" ]; then
+        fail 'destination exists but partial state has no provider checksum to prove crash recovery'
+    fi
+    verify_complete_file "$destination"
+    if [ "$transfer_status" = complete ] && [ -n "$stored_local_sha256" ] &&
+       [ "$stored_local_sha256" != "$local_sha256" ]; then
+        runtime_fail 'completed destination changed since its download receipt'
+    fi
+    write_state complete "$source_size" "$local_sha256"
+    write_receipt
+    cat "$receipt_file"
+    exit 0
+fi
+
+if [ -f "$state_file" ]; then
+    load_and_match_state
+    [ "$transfer_status" = partial ] || fail 'state says complete but destination is missing'
+    [ -f "$partial_file" ] || fail 'download state exists but partial file is missing'
+    [ ! -L "$partial_file" ] || fail 'partial file must not be a symbolic link'
+    reconcile_result=$("$transfer_helper" reconcile "$partial_file" "$bytes_complete" "$source_size")
+    tab=$(printf '\t')
+    IFS="$tab" read -r reconcile_kind partial_size recorded_size <<EOF_RECONCILE
+$reconcile_result
+EOF_RECONCILE
+    case $reconcile_kind in
+        exact) ;;
+        truncate)
+            printf 'reconcile=truncate-uncommitted-tail from=%s to=%s\n' "$partial_size" "$recorded_size" >&2
+            "$transfer_helper" truncate "$partial_file" "$recorded_size"
+            ;;
+        short) fail 'partial file is shorter than its durable state; refusing corrupt resume' ;;
+        *) fail 'transfer helper returned an unknown reconciliation result' ;;
+    esac
+else
+    [ ! -e "$partial_file" ] && [ ! -L "$partial_file" ] ||
+        fail 'partial file exists without matching download state'
+    : > "$partial_file"
+    chmod 600 "$partial_file"
+    bytes_complete=0
+    transfer_status=partial
+    write_state partial 0
+fi
+
+while :; do
+    range_plan=$("$transfer_helper" plan "$source_size" "$bytes_complete" "$chunk_size")
+    [ "$range_plan" != complete ] || break
+    tab=$(printf '\t')
+    IFS="$tab" read -r range_kind range_start range_end range_length range_next <<EOF_RANGE
+$range_plan
+EOF_RANGE
+    [ "$range_kind" = range ] || fail 'transfer helper returned an unknown plan'
+    fetch_segment
+    "$transfer_helper" append "$partial_file" "$segment_file" "$range_start" "$range_length"
+    : > "$segment_file"
+    bytes_complete=$range_next
+    write_state partial "$bytes_complete"
+    printf 'downloaded_bytes=%s expected_bytes=%s\n' "$bytes_complete" "$source_size" >&2
+done
+
+verify_remote_metadata_unchanged
+verify_complete_file "$partial_file"
+"$transfer_helper" finalize "$partial_file" "$destination" "$source_size"
+write_state complete "$source_size" "$local_sha256"
+write_receipt
+cat "$receipt_file"

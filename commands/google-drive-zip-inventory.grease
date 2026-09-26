@@ -5,6 +5,7 @@ export LC_ALL
 
 script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 api_command=$script_directory/google-drive-api.grease
+auth_command=${GOOGLE_DRIVE_AUTH:-$script_directory/google-drive-auth.grease}
 zip_indexer=${ZIP_CENTRAL_DIRECTORY:-zip-central-directory}
 
 usage() {
@@ -37,6 +38,9 @@ directory. At most one selector may be supplied:
   --glob GLOB
 
 Environment:
+  GOOGLE_DRIVE_CREDENTIAL_FILE
+      Private google-drive-auth credential with automatic refresh.
+
   GOOGLE_ACCESS_TOKEN / GOOGLE_ACCESS_TOKEN_FILE
   GOOGLE_DRIVE_RESOURCE_KEYS
       Same authentication/resource-key boundary as google-drive-api.
@@ -106,12 +110,42 @@ run_api() {
     fi
 }
 
-require_token() {
+run_auth() {
+    if [ -n "${GREASE:-}" ]; then
+        "$GREASE" "$auth_command" "$@"
+    else
+        "$auth_command" "$@"
+    fi
+}
+
+write_auth_config() {
+    refresh_mode=$1
     token=${GOOGLE_ACCESS_TOKEN:-}
     if ⟦ -z "$token" ∧ -n "${GOOGLE_ACCESS_TOKEN_FILE:-}" ⟧; then
         token=$(cat -- "$GOOGLE_ACCESS_TOKEN_FILE")
     fi
-    [ -n "$token" ] || fail 'set GOOGLE_ACCESS_TOKEN or GOOGLE_ACCESS_TOKEN_FILE'
+    if [ -n "$token" ]; then
+        printf 'header = "Authorization: Bearer %s"\n' "$token" > "$curl_config"
+        return
+    fi
+    credential_file=${GOOGLE_DRIVE_CREDENTIAL_FILE:-}
+    [ -n "$credential_file" ] ||
+        fail 'set GOOGLE_DRIVE_CREDENTIAL_FILE, GOOGLE_ACCESS_TOKEN, or GOOGLE_ACCESS_TOKEN_FILE'
+    rm -f -- "$curl_config"
+    if [ "$refresh_mode" = force ]; then
+        run_auth curl-config "$credential_file" "$curl_config" --force-refresh
+    else
+        run_auth curl-config "$credential_file" "$curl_config"
+    fi
+}
+
+refresh_auth_config() {
+    [ -n "${GOOGLE_DRIVE_CREDENTIAL_FILE:-}" ] || return 1
+    write_auth_config force
+    if [ -n "${GOOGLE_DRIVE_RESOURCE_KEYS:-}" ]; then
+        printf 'header = "X-Goog-Drive-Resource-Keys: %s"\n' \
+            "$GOOGLE_DRIVE_RESOURCE_KEYS" >> "$curl_config"
+    fi
 }
 
 prepare_ranges() {
@@ -119,7 +153,6 @@ prepare_ranges() {
     need_command jq
     require_bounded_curl
     need_command "$zip_indexer"
-    require_token
 
     temporary_root=${TMPDIR:-/tmp}
     mkdir -p "$temporary_root"
@@ -129,7 +162,7 @@ prepare_ranges() {
     trap cleanup EXIT HUP INT TERM
 
     umask 077
-    printf 'header = "Authorization: Bearer %s"\n' "$token" > "$curl_config"
+    write_auth_config normal
     if [ -n "${GOOGLE_DRIVE_RESOURCE_KEYS:-}" ]; then
         printf 'header = "X-Goog-Drive-Resource-Keys: %s"\n' \
             "$GOOGLE_DRIVE_RESOURCE_KEYS" >> "$curl_config"
@@ -143,7 +176,11 @@ fetch_range() {
     output=$4
     headers=$5
 
-    curl \
+    range_error=$headers.stderr
+    range_url="https://www.googleapis.com/drive/v3/files/$file_id?alt=media&supportsAllDrives=true"
+    : > "$headers"
+    : > "$range_error"
+    if ! curl \
         --config "$curl_config" \
         --fail \
         --silent \
@@ -153,12 +190,45 @@ fetch_range() {
         --dump-header "$headers" \
         --max-filesize "$length" \
         --output "$output" \
-        "https://www.googleapis.com/drive/v3/files/$file_id?alt=media&supportsAllDrives=true"
+        "$range_url" 2>"$range_error"
+    then
+        range_status=$(awk '/^HTTP\/[0-9.]+ [0-9][0-9][0-9]/{status=$2} END{print status}' "$headers")
+        if [ "$range_status" = 401 ] && refresh_auth_config; then
+            rm -f -- "$output"
+            : > "$headers"
+            : > "$range_error"
+            curl \
+                --config "$curl_config" \
+                --fail \
+                --silent \
+                --show-error \
+                --request GET \
+                --header "Range: bytes=$start-$end" \
+                --dump-header "$headers" \
+                --max-filesize "$length" \
+                --output "$output" \
+                "$range_url" 2>"$range_error" || {
+                    printf 'Drive range request failed after token refresh for bytes=%s-%s\n' "$start" "$end" >&2
+                    return 1
+                }
+        else
+            case $range_status in
+                401) printf '%s\n' 'Drive range request rejected the access token; authorize again' >&2 ;;
+                403) printf '%s\n' 'Drive range request was forbidden; OAuth scope or file permissions may be insufficient' >&2 ;;
+                '') cat "$range_error" >&2 ;;
+                *) printf 'Drive range request failed with HTTP %s\n' "$range_status" >&2 ;;
+            esac
+            return 1
+        fi
+    fi
 
     grep -E '^HTTP/[0-9.]+ 206([[:space:]]|$)' "$headers" >/dev/null ∨
         fail "Drive range request did not return HTTP 206 for bytes=$start-$end"
     tr -d '\r' < "$headers" | grep -Fxi "Content-Range: bytes $start-$end/$source_size" >/dev/null ∨
         fail "Drive range response did not confirm exactly bytes $start-$end/$source_size"
+    actual_length=$(wc -c < "$output" | tr -d '[:space:]')
+    [ "$actual_length" = "$length" ] ∨
+        fail "Drive range response length $actual_length did not match requested length $length"
 }
 
 case ${1:-} in
@@ -169,6 +239,7 @@ case ${1:-} in
 esac
 
 file_id=$(drive_id "$1")
+case $file_id in *[!A-Za-z0-9_-]*) fail 'Drive file id contains unsupported URL-path bytes' ;; esac
 shift
 selection_option=
 selection_value=

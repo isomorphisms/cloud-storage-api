@@ -56,10 +56,20 @@ the session URI before transferring content, and retains that record on failure.
 This keeps the large-upload boundary restartable rather than quietly treating a
 large body as an ordinary request.
 
-Authentication is supplied with `GOOGLE_ACCESS_TOKEN` or
-`GOOGLE_ACCESS_TOKEN_FILE`. Tokens are placed in a private curl config rather
-than curl argv. `GOOGLE_DRIVE_RESOURCE_KEYS` can supply the documented
-`X-Goog-Drive-Resource-Keys` header when link-shared resources require it.
+`commands/google-drive-auth.grease` implements the installed-application OAuth
+flow with PKCE, state validation, a random loopback callback port, private
+refresh-token storage, expiry handling, and automatic refresh. It requests the
+read-only Drive scope needed to discover and download an already-existing
+Takeout object. Set `GOOGLE_DRIVE_CREDENTIAL_FILE` to that private credential;
+ordinary API, download, and ZIP-range requests no longer require a manually
+copied hourly access token. Explicit `GOOGLE_ACCESS_TOKEN` and
+`GOOGLE_ACCESS_TOKEN_FILE` remain lower-level fallbacks.
+
+Tokens are placed in a private curl config rather than curl argv.
+`GOOGLE_DRIVE_RESOURCE_KEYS` can supply the documented
+`X-Goog-Drive-Resource-Keys` header when link-shared resources require it. See
+[`docs/google-drive-auth-download.md`](docs/google-drive-auth-download.md) for
+the one-time authorization and exact command path.
 
 `commands/google-drive-files.grease` is the smaller convenience layer for the
 reader-oriented operations already in use:
@@ -72,6 +82,18 @@ reader-oriented operations already in use:
 Its list/get projection includes `hasThumbnail`, `thumbnailLink`,
 `thumbnailVersion`, image metadata, and video metadata so a viewer can maintain
 a local thumbnail cache without making those links part of durable identity.
+
+`commands/google-drive-download.grease` is the restartable stored-byte path for
+large blobs. It takes an opaque Drive file ID and an explicit local destination,
+inspects metadata before transfer, writes bounded HTTP ranges progressively,
+and keeps the payload-bearing partial and segment beside the destination. A
+small private sidecar binds resume state to the Drive ID, size, provider
+version, modification time, strongest available provider checksum, chunk size,
+and durable byte count. The fixed-width C helper owns offsets above 4 GiB plus
+append/fsync/rename boundaries, including on ARMv7. Completion requires exact
+length and any usable Drive checksum, and records a local SHA-256 receipt.
+The convenience layer's older `download FILE` remains a one-shot byte stream;
+it is not the large-file resume path.
 
 `commands/google-drive-unzip.ysh` remains the separate Apps Script archive
 workflow for now. It is not a Drive v3 endpoint: the Drive API itself has no
@@ -123,6 +145,10 @@ transport executed by the pinned Grease runtime covers both paths. These remain
 stages 1 and 2 only. They are not evidence for authenticated Drive inventory,
 live extraction, retry/resume, or the 7.75 GB Takeout archive; those remain
 stages 3–7.
+
+OAuth and restartable-download fake-server tests do not advance issue #7's live
+stages. In particular, automatic refresh and deterministic range-resume evidence
+are not authenticated Drive, Takeout, or physical Android receipts.
 
 ## Provider boundary
 

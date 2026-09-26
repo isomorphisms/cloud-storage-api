@@ -152,7 +152,12 @@ static void resolve_zip64_extra(const unsigned char *extra, size_t n,
     int need_compressed = compressed32 == 0xffffffffu;
     int need_offset = local_offset32 == 0xffffffffu;
     int need_disk = disk_start16 == 0xffffu;
-    int need_zip64 = need_uncompressed || need_compressed || need_offset || need_disk;
+    unsigned required_mask =
+        (need_uncompressed ? 1u : 0u) |
+        (need_compressed ? 2u : 0u) |
+        (need_offset ? 4u : 0u) |
+        (need_disk ? 8u : 0u);
+    int need_zip64 = required_mask != 0;
     int saw_zip64 = 0;
 
     *uncompressed = uncompressed32;
@@ -170,27 +175,84 @@ static void resolve_zip64_extra(const unsigned char *extra, size_t n,
         if (tag == ZIP64_EXTRA) {
             if (saw_zip64) die("duplicate ZIP64 extended information extra field");
             saw_zip64 = 1;
-            size_t z = 0;
             const unsigned char *p = extra + pos;
+            int found = 0;
+            int ambiguous = 0;
+            uint64_t chosen_uncompressed = uncompressed32;
+            uint64_t chosen_compressed = compressed32;
+            uint64_t chosen_offset = local_offset32;
+            uint32_t chosen_disk = disk_start16;
 
-            if (need_uncompressed) {
-                if (z + 8 > size) die("truncated ZIP64 uncompressed size");
-                *uncompressed = le64(p + z); z += 8;
+            /*
+             * APPNOTE says non-ZIP64 central-directory fields should be omitted
+             * from this extra record. Some streaming ZIP writers nevertheless
+             * retain redundant values. Accept those only when they exactly
+             * agree with the ordinary central-directory fields. Enumerating the
+             * possible ordered field subsets keeps required sentinel values
+             * unambiguous instead of guessing from record length.
+             */
+            for (unsigned mask = 0; mask < 16; ++mask) {
+                if ((mask & required_mask) != required_mask) continue;
+
+                size_t expected = 0;
+                if (mask & 1u) expected += 8;
+                if (mask & 2u) expected += 8;
+                if (mask & 4u) expected += 8;
+                if (mask & 8u) expected += 4;
+                if (expected != size) continue;
+
+                size_t z = 0;
+                int valid = 1;
+                uint64_t candidate_uncompressed = uncompressed32;
+                uint64_t candidate_compressed = compressed32;
+                uint64_t candidate_offset = local_offset32;
+                uint32_t candidate_disk = disk_start16;
+
+                if (mask & 1u) {
+                    uint64_t value = le64(p + z); z += 8;
+                    if (need_uncompressed) candidate_uncompressed = value;
+                    else if (value != uncompressed32) valid = 0;
+                }
+                if (mask & 2u) {
+                    uint64_t value = le64(p + z); z += 8;
+                    if (need_compressed) candidate_compressed = value;
+                    else if (value != compressed32) valid = 0;
+                }
+                if (mask & 4u) {
+                    uint64_t value = le64(p + z); z += 8;
+                    if (need_offset) candidate_offset = value;
+                    else if (value != local_offset32) valid = 0;
+                }
+                if (mask & 8u) {
+                    uint32_t value = le32(p + z); z += 4;
+                    if (need_disk) candidate_disk = value;
+                    else if (value != disk_start16) valid = 0;
+                }
+                if (!valid || z != size) continue;
+
+                if (!found) {
+                    chosen_uncompressed = candidate_uncompressed;
+                    chosen_compressed = candidate_compressed;
+                    chosen_offset = candidate_offset;
+                    chosen_disk = candidate_disk;
+                    found = 1;
+                } else if (chosen_uncompressed != candidate_uncompressed ||
+                           chosen_compressed != candidate_compressed ||
+                           chosen_offset != candidate_offset ||
+                           chosen_disk != candidate_disk) {
+                    ambiguous = 1;
+                }
             }
-            if (need_compressed) {
-                if (z + 8 > size) die("truncated ZIP64 compressed size");
-                *compressed = le64(p + z); z += 8;
-            }
-            if (need_offset) {
-                if (z + 8 > size) die("truncated ZIP64 local-header offset");
-                *local_offset = le64(p + z); z += 8;
-            }
-            if (need_disk) {
-                if (z + 4 > size) die("truncated ZIP64 disk-start number");
-                *disk_start = le32(p + z); z += 4;
-            }
-            if (z != size)
-                die("ZIP64 extended information contains fields not selected by sentinel values");
+
+            if (!found)
+                die("ZIP64 extended information is inconsistent with central-directory fields");
+            if (ambiguous)
+                die("ZIP64 extended information is ambiguous");
+
+            *uncompressed = chosen_uncompressed;
+            *compressed = chosen_compressed;
+            *local_offset = chosen_offset;
+            *disk_start = chosen_disk;
         }
         pos += size;
     }

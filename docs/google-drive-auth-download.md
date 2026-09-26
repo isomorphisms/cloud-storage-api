@@ -1,0 +1,189 @@
+# Google Drive authentication and stored-byte download
+
+This path uses the documented Google OAuth installed-application flow and the
+Drive v3 HTTP API directly. It does not invoke `rclone`, a generated Google SDK,
+or a heavyweight client library.
+
+The implementation follows these Google references, checked on 2026-09-20:
+
+- <https://developers.google.com/identity/protocols/oauth2/native-app>
+- <https://developers.google.com/identity/protocols/oauth2/resources/best-practices>
+- <https://developers.google.com/workspace/drive/api/guides/api-specific-auth>
+- <https://developers.google.com/workspace/drive/api/guides/manage-downloads>
+
+The pinned discovery mirror remains normative for the Drive method and file
+schema used by this repository.
+
+## One-time Google setup
+
+1. In a user-owned Google Cloud project, enable Google Drive API v3.
+2. Configure the OAuth consent screen and add the intended account as a test
+   user when the application remains in testing.
+3. Create an OAuth client of type **Desktop app** and download its client JSON.
+   The shell client uses the desktop installed-app PKCE flow and a random
+   `127.0.0.1` callback port. It does not use the removed out-of-band flow.
+
+The OAuth helper requests only:
+
+```text
+https://www.googleapis.com/auth/drive.readonly
+```
+
+`drive.file` is narrower but cannot discover an existing Takeout object that
+the application did not create or open. The read-only Drive scope is therefore
+the least privilege that satisfies this workflow. It does not authorize the
+write methods exposed by the separate thin API command.
+
+## Build or install the small native helpers
+
+The product commands are Grease. Small C helpers own boundaries that should not
+be improvised in shell: the loopback callback socket, fixed-width file
+offset/fsync operations, and the already-established bounded ZIP parser.
+
+From a checkout, with an explicit installation directory:
+
+```sh
+repo=/absolute/path/to/cloud-storage-api
+program_directory=/absolute/path/to/private/program-directory
+
+mkdir -p "$program_directory"
+cc -std=c99 -Wall -Wextra -Werror -O2 \
+  "$repo/commands/google-oauth-loopback.c" \
+  -o "$program_directory/google-oauth-loopback"
+cc -std=c99 -Wall -Wextra -Werror -O2 \
+  "$repo/commands/google-drive-download-state.c" \
+  -o "$program_directory/google-drive-download-state"
+cc -std=c99 -Wall -Wextra -Werror -O2 \
+  "$repo/commands/zip-central-directory.c" \
+  -o "$program_directory/zip-central-directory"
+install -m 755 \
+  "$repo/commands/google-drive-auth.grease" \
+  "$repo/commands/google-drive-api.grease" \
+  "$repo/commands/google-drive-files.grease" \
+  "$repo/commands/google-drive-download.grease" \
+  "$repo/commands/google-drive-zip-inventory.grease" \
+  "$program_directory/"
+```
+
+Put that explicit program directory in `PATH`, or set the helper path variables
+documented by each command. These commands resolve their companion Grease files
+from the script directory and do not depend on the caller's current directory.
+
+## Authorize once and refresh automatically
+
+Import Google's downloaded client file into the durable private plain-text
+credential, then authorize:
+
+```sh
+google-drive-auth init \
+  /explicit/path/to/client_secret.json \
+  /explicit/private/path/google-drive.credentials \
+  --create-parent
+
+google-drive-auth authorize \
+  /explicit/private/path/google-drive.credentials
+```
+
+`authorize` generates a fresh PKCE verifier/challenge and state value, binds a
+random IPv4 loopback port, opens the system browser when possible, validates the
+returned state, exchanges the code, and stores the refresh/access tokens in the
+mode-0600 credential. Authorization codes and tokens are sent in private files
+or request bodies, not process arguments.
+
+For a remote/headless shell, use the explicit two-step form. The callback URL
+is read from stdin so its code is not an argument:
+
+```sh
+google-drive-auth begin \
+  /explicit/private/path/google-drive.credentials \
+  http://127.0.0.1:53682 \
+  > /explicit/private/path/authorization-url
+
+# Open the saved URL, then save the complete browser callback URL privately.
+chmod 600 /explicit/private/path/callback-url
+google-drive-auth complete \
+  /explicit/private/path/google-drive.credentials \
+  < /explicit/private/path/callback-url
+```
+
+Ordinary commands then need only the credential location:
+
+```sh
+export GOOGLE_DRIVE_CREDENTIAL_FILE=/explicit/private/path/google-drive.credentials
+```
+
+They refresh before expiry. A multi-request range operation also refreshes once
+and retries when Drive returns HTTP 401. Revoked refresh tokens stop with an
+instruction to authorize again. The credential, pending state, curl
+configuration, and token response files are private and must never be committed.
+
+## Locate the exact Takeout object
+
+Drive file ID is the identity. Search by metadata, then retain the returned ID:
+
+```sh
+google-drive-files list \
+  --query "name = 'takeout-20260505T145639Z-3-001.zip' and trashed = false"
+
+google-drive-files get DRIVE_FILE_ID
+```
+
+For the known object, verify that metadata reports exactly `7,754,047,385`
+bytes before treating it as the intended archive. A name match alone is not an
+identity proof. `files.list` still exposes `nextPageToken`; callers must follow
+it with `--page` when a broad query is paginated.
+
+## Restartable direct download to an explicit destination
+
+For the phone, first verify the removable mount on that device. Then supply the
+SD-backed destination itself; no checkout location is assumed:
+
+```sh
+google-drive-download DRIVE_FILE_ID \
+  /storage/4A21-0000/Android/data/com.termux/files/takeout-20260505T145639Z-3-001.zip \
+  --create-parent
+```
+
+The command:
+
+- fetches ID, byte length, provider version, modification time, download
+  capability, and the strongest Drive checksum available;
+- keeps the partial payload and each bounded segment beside the destination,
+  so a multi-gigabyte file is not staged through internal `HOME`, `PREFIX`,
+  `TMPDIR`, or the source checkout;
+- requires HTTP 206, exact `Content-Range`, exact response length, and curl 8.4
+  or newer's running `--max-filesize` limit;
+- fsyncs every appended segment before atomically advancing the small sidecar;
+- truncates an uncommitted crash tail back to the last durable byte boundary,
+  but rejects a partial shorter than its state;
+- refuses remote identity, size, version, modification-time, or checksum drift;
+- verifies final size and the strongest provider checksum available, records a
+  local SHA-256, then durably renames the partial file into place;
+- refuses an unrelated existing destination and never deletes the Drive source.
+
+The default sidecars are:
+
+```text
+DESTINATION.google-drive.partial
+DESTINATION.google-drive.state
+DESTINATION.google-drive.receipt.ndjson
+```
+
+The payload-bearing partial and range segment are always adjacent to
+`DESTINATION`. `--state-file` and `--receipt-file` may move only the small
+metadata sidecars.
+
+## Bounded inventory is a different workflow
+
+To inventory or select members without downloading all 7.75 GB, use the ranged
+ZIP command with the same credential:
+
+```sh
+google-drive-zip-inventory DRIVE_FILE_ID \
+  > /explicit/path/takeout-inventory.ndjson
+```
+
+That remains issue #7's inventory path. Deterministic local and fake-Drive
+stages have passed. A real credential, real Drive ZIP, actual Takeout inventory,
+selected-member extraction, and physical-phone execution remain independent
+evidence boundaries until their receipts exist.

@@ -23,6 +23,10 @@ list/get include thumbnail metadata needed by local viewers:
   thumbnailVersion
   imageMediaMetadata
   videoMediaMetadata
+
+download writes a one-shot stored-byte response to stdout. For a large,
+restartable transfer to an explicit path, use:
+  google-drive-download FILE DESTINATION
 EOF
 }
 

@@ -121,6 +121,39 @@ Whenever giving the human a script or command block, assume `$PWD` is arbitrary.
 - Do not broaden to full-Drive access merely to avoid designing a narrower flow.
 - Do not embed reusable user credentials or shared secrets in binaries.
 - Keep authentication architecture separate from the storage object model so it can change without rewriting object identity.
+- The repository-owned read path uses the documented desktop installed-app flow
+  with PKCE, state validation, and a random IPv4 loopback port. Do not restore
+  the removed out-of-band flow or put authorization codes in process arguments.
+- `drive.readonly` is the current least-privileged scope that can locate and
+  read an existing Takeout object. `drive.file` is not a substitute for objects
+  the application did not create or open. This read credential is not evidence
+  that mutating methods on the thin full surface are authorized.
+- Durable OAuth state is an explicit mode-0600 ordinary file. Never source it as
+  shell code, print its secret fields, or copy token responses into receipts.
+- A fake token endpoint proves state-machine behavior only. Live authorization
+  requires a real user grant and a successful request made by this client.
+
+### Restartable stored-byte download
+
+- Drive file ID and current metadata fingerprint the transfer. Refuse resume
+  when ID, size, provider version, modification time, or strongest available
+  provider checksum differs from the sidecar.
+- Keep payload-bearing partial and segment files beside the caller's explicit
+  destination. `TMPDIR`, an internal checkout, and Termux internal storage may
+  hold only bounded metadata when the destination is on removable storage.
+- Every requested segment must return HTTP 206, exact `Content-Range`, and exact
+  length under a running response-size bound. A 200 response is a failure, not
+  permission to replace a partial file with an unbounded body.
+- Advance the durable byte count only after the append is fsynced. A crash tail
+  longer than the last durable state may be truncated back; a file shorter than
+  its state is corruption and must stop.
+- Keep multi-gigabyte offset planning, file-size comparison, append, truncate,
+  fsync, and final rename in the fixed-width native helper so ARMv7 shell
+  arithmetic is not an implicit boundary.
+- A completed destination must have exact byte length and, when Drive supplies
+  one, a matching provider checksum. Record a local SHA-256 separately.
+- Full stored-byte download and issue #7 ranged inventory/selective extraction
+  are different workflows and must retain different receipts and claims.
 
 ## Evidence and acceptance
 

@@ -8,7 +8,7 @@ helper=$temporary/zip-central-directory
 cc -std=c99 -Wall -Wextra -Werror -O2 "$source_c" -o "$helper"
 
 python3 - "$temporary" <<'PY'
-import os, struct, sys, warnings, zipfile
+import os, struct, sys, warnings, zipfile, zlib
 warnings.filterwarnings('ignore', message='Duplicate name:.*')
 root=sys.argv[1]
 
@@ -48,6 +48,31 @@ locator=struct.pack('<IIQI',0x07064b50,0,cd+len(central),1)
 eocd=struct.pack('<IHHHHIIH',0x06054b50,0,0,1,1,len(central),0xffffffff,0)
 with open(p,'wb') as f:
     f.write(local+name+local_extra); f.seek(cd); f.write(central+z64+locator+eocd)
+
+# Some streaming ZIP writers retain ZIP64 extra values even when the ordinary
+# central-directory fields are not sentinels. Accept only redundant values
+# that agree exactly with those ordinary fields.
+def write_redundant_zip64(path, compressed_sentinel):
+    name=b'Takeout/conversations.json'
+    data=b'[]'
+    crc=zlib.crc32(data) & 0xffffffff
+    local=struct.pack(
+        '<IHHHHHIIIHH',
+        0x04034b50,45,0,0,0,0,crc,len(data),len(data),len(name),0)
+    central_offset=len(local)+len(name)+len(data)
+    extra=struct.pack('<HHQQ',0x0001,16,len(data),len(data))
+    compressed32=0xffffffff if compressed_sentinel else len(data)
+    central=struct.pack(
+        '<IHHHHHHIIIHHHHHII',
+        0x02014b50,45,45,0,0,0,0,crc,compressed32,len(data),
+        len(name),len(extra),0,0,0,0,0) + name + extra
+    eocd=struct.pack(
+        '<IHHHHIIH',0x06054b50,0,0,1,1,len(central),central_offset,0)
+    with open(path,'wb') as f:
+        f.write(local+name+data+central+eocd)
+
+write_redundant_zip64(os.path.join(root,'zip64-redundant.zip'), False)
+write_redundant_zip64(os.path.join(root,'zip64-redundant-required.zip'), True)
 PY
 
 range_parts() {
@@ -100,6 +125,18 @@ printf '%s\n' "$zip64" | grep -F '"path":"Takeout/big.bin"' >/dev/null
 printf '%s\n' "$zip64" | grep -F '"compressed_size":5368709120' >/dev/null
 printf '%s\n' "$zip64" | grep -F '"uncompressed_size":5368709120' >/dev/null
 printf '%s\n' "$zip64" | grep -F '"central_directory_record_offset":5368709120' >/dev/null
+
+range_parts "$temporary/zip64-redundant.zip"
+redundant=$($helper list "$central_start" "$central_size" "$member_count" "$temporary/central.bin")
+printf '%s\n' "$redundant" | grep -F '"path":"Takeout/conversations.json"' >/dev/null
+printf '%s\n' "$redundant" | grep -F '"compressed_size":2' >/dev/null
+printf '%s\n' "$redundant" | grep -F '"uncompressed_size":2' >/dev/null
+
+range_parts "$temporary/zip64-redundant-required.zip"
+redundant_required=$($helper list "$central_start" "$central_size" "$member_count" "$temporary/central.bin")
+printf '%s\n' "$redundant_required" | grep -F '"path":"Takeout/conversations.json"' >/dev/null
+printf '%s\n' "$redundant_required" | grep -F '"compressed_size":2' >/dev/null
+printf '%s\n' "$redundant_required" | grep -F '"uncompressed_size":2' >/dev/null
 
 reject() {
     archive=$1; expected=$2
