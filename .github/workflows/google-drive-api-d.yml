@@ -7,6 +7,7 @@ on:
       - 'commands/google-drive-v3-methods.tsv'
       - 'tests/google-drive-api-d.sh'
       - 'tests/google-drive-api-d-server.mjs'
+      - 'd/Makefile'
       - '.github/workflows/google-drive-api-d.yml'
   pull_request:
     paths:
@@ -14,6 +15,7 @@ on:
       - 'commands/google-drive-v3-methods.tsv'
       - 'tests/google-drive-api-d.sh'
       - 'tests/google-drive-api-d-server.mjs'
+      - 'd/Makefile'
       - '.github/workflows/google-drive-api-d.yml'
 
 jobs:
@@ -25,10 +27,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ldc libcurl4-openssl-dev
-      - name: Compile
-        run: |
-          mkdir -p build
-          ldc2 -O -release -Jcommands commands/google_drive_api.d \
-            -of=build/google-drive-api-d -L-lcurl
+      - name: Build
+        run: make -C d
       - name: Exercise thin Drive surface and resumable recovery
-        run: sh tests/google-drive-api-d.sh build/google-drive-api-d
+        run: make -C d test
