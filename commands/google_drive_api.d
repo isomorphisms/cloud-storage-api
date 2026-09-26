@@ -237,8 +237,8 @@ private string header_value(const Response response, string wanted) {
         if (name.length == wanted.length) {
             bool equal = true;
             foreach (index; 0 .. name.length) {
-                auto left = name[index];
-                auto right = wanted[index];
+                char left = name[index];
+                char right = wanted[index];
                 if (left >= 'A' && left <= 'Z') left = cast(char)(left + ('a' - 'A'));
                 if (right >= 'A' && right <= 'Z') right = cast(char)(right + ('a' - 'A'));
                 if (left != right) { equal = false; break; }
