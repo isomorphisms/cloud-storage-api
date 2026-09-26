@@ -34,12 +34,14 @@ run_client() {
         "$binary" "$@"
 }
 
+printf '%s\n' 'stage: method surface' >&2
 method_count=$(run_client methods | wc -l | tr -d '[:space:]')
 [ "$method_count" = 64 ] || { printf 'expected 64 methods, got %s\n' "$method_count" >&2; exit 1; }
 
 run_client surface > "$temporary/surface.tsv"
 cmp "$root/commands/google-drive-v3-methods.tsv" "$temporary/surface.tsv"
 
+printf '%s\n' 'stage: list request' >&2
 list_output=$(run_client files.list \
     --query "q=name contains 'report'" \
     --query 'fields=nextPageToken,files(id,name)')
@@ -47,6 +49,7 @@ list_output=$(run_client files.list \
 grep -F '"url":"/drive/v3/files?q=name%20contains%20%27report%27&fields=nextPageToken%2Cfiles%28id%2Cname%29"' "$log_file" >/dev/null
 grep -F '"resource_keys":"FILE123/RESOURCEKEY"' "$log_file" >/dev/null
 
+printf '%s\n' 'stage: JSON body request' >&2
 body=$temporary/permission.json
 printf '%s\n' '{"type":"user","role":"reader","emailAddress":"reader@example.test"}' > "$body"
 permission_output=$(run_client permissions.create \
@@ -57,6 +60,7 @@ permission_output=$(run_client permissions.create \
 grep -F '"method":"POST","url":"/drive/v3/files/FILE123/permissions?supportsAllDrives=true"' "$log_file" >/dev/null
 grep -F '"body":"{\"type\":\"user\",\"role\":\"reader\",\"emailAddress\":\"reader@example.test\"}\\n"' "$log_file" >/dev/null
 
+printf '%s\n' 'stage: request validation' >&2
 if run_client files.get --query alt=media > /dev/null 2> "$temporary/missing-path.err"; then
     printf '%s\n' 'files.get accepted a missing fileId' >&2
     exit 1
@@ -69,6 +73,7 @@ if run_client files.list --body "$body" > /dev/null 2> "$temporary/no-body.err";
 fi
 grep -F 'drive.files.list has no request body' "$temporary/no-body.err" >/dev/null
 
+printf '%s\n' 'stage: fresh resumable upload' >&2
 metadata=$temporary/metadata.json
 media=$temporary/data.bin
 session=$temporary/upload.session
@@ -84,6 +89,7 @@ upload_output=$(run_client files.create \
 grep -F '"content_range":"bytes 0-9/10"' "$log_file" >/dev/null
 grep -F '"content_range":"bytes 4-9/10","body":"567890"' "$log_file" >/dev/null
 
+printf '%s\n' 'stage: persisted resumable recovery' >&2
 resume=$temporary/resume.session
 cat > "$resume" <<EOF_SESSION
 {"method":"drive.files.create","path":"files","media":"$media","media_type":"application/octet-stream","media_size":10,"session_uri":"$base/session/RESUME"}
