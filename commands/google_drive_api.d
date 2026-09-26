@@ -8,7 +8,7 @@ import std.exception : enforce;
 import std.file : exists, getSize, mkdirRecurse, read, readText, remove, rename, write;
 import std.format : formattedWrite, format;
 import std.json : JSONValue, parseJSON;
-import std.net.curl : HTTP, CurlException, StatusLine;
+import std.net.curl : HTTP, CurlException;
 import std.path : dirName;
 import std.process : environment;
 import std.stdio : File, stdin, stdout, stderr;
@@ -169,7 +169,7 @@ private Response request_memory(
         http.contentLength = 0;
     }
 
-    http.onReceiveStatusLine = (StatusLine line) { status = line.code; };
+    http.onReceiveStatusLine = (HTTP.StatusLine line) { status = line.code; };
     http.onReceiveHeader = (in char[] key, in char[] value) {
         if (key.length != 0) response_headers[key.idup] = value.idup.strip.idup;
     };
@@ -203,7 +203,7 @@ private void request_to_stdout(
         http.contentLength = 0;
     }
 
-    http.onReceiveStatusLine = (StatusLine line) { status = line.code; };
+    http.onReceiveStatusLine = (HTTP.StatusLine line) { status = line.code; };
     http.onReceive = (ubyte[] data) {
         if (status >= 400) error_body.put(data);
         else stdout.rawWrite(data);
@@ -359,7 +359,7 @@ private Response upload_from_offset(
         );
     }
 
-    http.onReceiveStatusLine = (StatusLine line) { status = line.code; };
+    http.onReceiveStatusLine = (HTTP.StatusLine line) { status = line.code; };
     http.onReceiveHeader = (in char[] key, in char[] value) {
         if (key.length != 0) response_headers[key.idup] = value.idup.strip.idup;
     };
